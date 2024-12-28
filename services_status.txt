@@ -1,0 +1,105 @@
+  UNIT                                                  LOAD   ACTIVE     SUB          DESCRIPTION
+  accounts-daemon.service                               loaded active     running      Accounts Service
+  alsa-restore.service                                  loaded active     exited       Save/Restore Sound Card State
+  apache2.service                                       loaded active     running      The Apache HTTP Server
+  apparmor.service                                      loaded active     exited       Load AppArmor profiles
+  apport.service                                        loaded active     exited       automatic crash report generation
+  avahi-daemon.service                                  loaded active     running      Avahi mDNS/DNS-SD Stack
+  blk-availability.service                              loaded active     exited       Availability of block devices
+  colord.service                                        loaded active     running      Manage, Install and Generate Color Profiles
+  console-setup.service                                 loaded active     exited       Set console font and keymap
+  containerd.service                                    loaded active     running      containerd container runtime
+  cpufrequtils.service                                  loaded active     exited       LSB: set CPUFreq kernel parameters
+  cron.service                                          loaded active     running      Regular background program processing daemon
+  cups-browsed.service                                  loaded active     running      Make remote CUPS printers available locally
+  cups.service                                          loaded active     running      CUPS Scheduler
+  dbus.service                                          loaded active     running      D-Bus System Message Bus
+  docker.service                                        loaded active     running      Docker Application Container Engine
+  elasticsearch.service                                 loaded active     running      Elasticsearch
+  firebird3.0.service                                   loaded active     running      Firebird Database Server ( SuperServer )
+  fwupd.service                                         loaded active     running      Firmware update daemon
+  gdm.service                                           loaded active     running      GNOME Display Manager
+  gnome-remote-desktop.service                          loaded active     running      GNOME Remote Desktop
+  kerneloops.service                                    loaded active     running      Tool to automatically collect and submit kernel crash signatures
+  keyboard-setup.service                                loaded active     exited       Set the console keyboard layout
+  kmod-static-nodes.service                             loaded active     exited       Create List of Static Device Nodes
+  kubelet.service                                       loaded activating auto-restart kubelet: The Kubernetes Node Agent
+  libvirt-guests.service                                loaded active     exited       libvirt guests suspend/resume service
+  lm-sensors.service                                    loaded active     exited       Initialize hardware monitoring sensors
+  loadcpufreq.service                                   loaded active     exited       LSB: Load kernel modules needed to enable cpufreq scaling
+  lvm2-monitor.service                                  loaded active     exited       Monitoring of LVM2 mirrors, snapshots etc. using dmeventd or progress polling
+  memcached.service                                     loaded active     running      memcached daemon
+  ModemManager.service                                  loaded active     running      Modem Manager
+  mongod.service                                        loaded active     running      MongoDB Database Server
+  NetworkManager-wait-online.service                    loaded active     exited       Network Manager Wait Online
+  NetworkManager.service                                loaded active     running      Network Manager
+  nginx.service                                         loaded active     running      A high performance web server and a reverse proxy server
+  openvpn.service                                       loaded active     exited       OpenVPN service
+  php8.3-fpm.service                                    loaded active     running      The PHP 8.3 FastCGI Process Manager
+  plymouth-quit-wait.service                            loaded active     exited       Hold until boot process finishes up
+  plymouth-read-write.service                           loaded active     exited       Tell Plymouth To Write Out Runtime Data
+  plymouth-start.service                                loaded active     exited       Show Plymouth Boot Screen
+  podman-restart.service                                loaded active     exited       Podman Start All Containers With Restart Policy Set To Always
+  polkit.service                                        loaded active     running      Authorization Manager
+  postgresql.service                                    loaded active     exited       PostgreSQL RDBMS
+  postgresql@16-main.service                            loaded active     running      PostgreSQL Cluster 16-main
+  preload.service                                       loaded active     running      LSB: Adaptive readahead daemon
+  qemu-kvm.service                                      loaded active     exited       QEMU KVM preparation - module, ksm, hugepages
+  redis-server.service                                  loaded active     running      Advanced key-value store
+  rsyslog.service                                       loaded active     running      System Logging Service
+  rtkit-daemon.service                                  loaded active     running      RealtimeKit Scheduling Policy Service
+  setvtrgb.service                                      loaded active     exited       Set console scheme
+  snap.canonical-livepatch.canonical-livepatchd.service loaded active     running      Service for snap application canonical-livepatch.canonical-livepatchd
+  snap.docker.dockerd.service                           loaded active     running      Service for snap application docker.dockerd
+● snap.docker.nvidia-container-toolkit.service          loaded failed     failed       Service for snap application docker.nvidia-container-toolkit
+  snap.kubelet.daemon.service                           loaded activating auto-restart Service for snap application kubelet.daemon
+  snap.microk8s.daemon-apiserver-kicker.service         loaded active     running      Service for snap application microk8s.daemon-apiserver-kicker
+  snap.microk8s.daemon-cluster-agent.service            loaded active     running      Service for snap application microk8s.daemon-cluster-agent
+  snap.microk8s.daemon-containerd.service               loaded active     running      Service for snap application microk8s.daemon-containerd
+  snap.microk8s.daemon-k8s-dqlite.service               loaded active     running      Service for snap application microk8s.daemon-k8s-dqlite
+  snap.microk8s.daemon-kubelite.service                 loaded active     running      Service for snap application microk8s.daemon-kubelite
+  snapd.apparmor.service                                loaded active     exited       Load AppArmor profiles managed internally by snapd
+● snapd.failure.service                                 loaded failed     failed       Failure handling of the snapd snap
+● snapd.seeded.service                                  loaded failed     failed       Wait until snapd is fully seeded
+● snapd.service                                         loaded failed     failed       Snap Daemon
+  switcheroo-control.service                            loaded active     running      Switcheroo Control Proxy service
+  sysstat.service                                       loaded active     exited       Resets System Activity Logs
+  systemd-binfmt.service                                loaded active     exited       Set Up Additional Binary Formats
+  systemd-fsck@dev-disk-by\x2duuid-5D67\x2d8846.service loaded active     exited       File System Check on /dev/disk/by-uuid/5D67-8846
+  systemd-journal-flush.service                         loaded active     exited       Flush Journal to Persistent Storage
+  systemd-journald.service                              loaded active     running      Journal Service
+  systemd-logind.service                                loaded active     running      User Login Management
+  systemd-machined.service                              loaded active     running      Virtual Machine and Container Registration Service
+  systemd-modules-load.service                          loaded active     exited       Load Kernel Modules
+  systemd-oomd.service                                  loaded active     running      Userspace Out-Of-Memory (OOM) Killer
+  systemd-random-seed.service                           loaded active     exited       Load/Save OS Random Seed
+  systemd-remount-fs.service                            loaded active     exited       Remount Root and Kernel File Systems
+  systemd-resolved.service                              loaded active     running      Network Name Resolution
+  systemd-sysctl.service                                loaded active     exited       Apply Kernel Variables
+  systemd-timesyncd.service                             loaded active     running      Network Time Synchronization
+  systemd-tmpfiles-setup-dev-early.service              loaded active     exited       Create Static Device Nodes in /dev gracefully
+  systemd-tmpfiles-setup-dev.service                    loaded active     exited       Create Static Device Nodes in /dev
+  systemd-tmpfiles-setup.service                        loaded active     exited       Create Volatile Files and Directories
+  systemd-udev-trigger.service                          loaded active     exited       Coldplug All udev Devices
+  systemd-udevd.service                                 loaded active     running      Rule-based Manager for Device Events and Files
+  systemd-update-utmp.service                           loaded active     exited       Record System Boot/Shutdown in UTMP
+  systemd-user-sessions.service                         loaded active     exited       Permit User Sessions
+  tlp.service                                           loaded active     exited       TLP system startup/shutdown
+  udisks2.service                                       loaded active     running      Disk Manager
+  ufw.service                                           loaded active     exited       Uncomplicated firewall
+  unattended-upgrades.service                           loaded active     running      Unattended Upgrades Shutdown
+  upower.service                                        loaded active     running      Daemon for power management
+  user-runtime-dir@1000.service                         loaded active     exited       User Runtime Directory /run/user/1000
+  user@1000.service                                     loaded active     running      User Manager for UID 1000
+● vboxadd-service.service                               loaded failed     failed       vboxadd-service.service
+● vboxadd.service                                       loaded failed     failed       vboxadd.service
+  virtlockd.service                                     loaded active     running      libvirt locking daemon
+  virtlogd.service                                      loaded active     running      libvirt logging daemon
+  wpa_supplicant.service                                loaded active     running      WPA supplicant
+
+Legend: LOAD   → Reflects whether the unit definition was properly loaded.
+        ACTIVE → The high-level unit activation state, i.e. generalization of SUB.
+        SUB    → The low-level unit activation state, values depend on unit type.
+
+97 loaded units listed. Pass --all to see loaded but inactive units, too.
+To show all installed unit files use 'systemctl list-unit-files'.
