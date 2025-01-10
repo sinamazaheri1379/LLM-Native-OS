@@ -1,1 +1,1 @@
-CMakeLists.txt not found in /home/sina-mazaheri/CLionProjects/LLM-Native-AIOS Select CMakeLists.txt
+CMakeLists.txt not found in /home/sina-mazaheri/CLionProjects/LLM-Native-OS Select CMakeLists.txt
