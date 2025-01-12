@@ -1,642 +1,942 @@
-//
-// Created by sina-mazaheri on 12/17/24.
-//
-//
-// Created by sina-mazaheri on 12/17/24.
-//
-#include "../include/llm_providers.h"
 #include <linux/module.h>
-#include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/slab.h>
-#include <linux/net.h>
-#include <linux/socket.h>
-#include <linux/tcp.h>
-#include <linux/in.h>
+#include <linux/string.h>
 #include <linux/mutex.h>
-#include <linux/inet.h>
-#include <net/sock.h>
-#include <linux/dns_resolver.h>
-#include <linux/tls.h>
-#include <linux/tcp.h>
-#include <linux/time.h>
+#include <linux/list.h>
+#include <linux/jiffies.h>
+#include "llm_providers.h"
 
-#define LLM_CONNECT_TIMEOUT_MS 5000
-#define LLM_MAX_RETRIES 3
-#define LLM_RETRY_DELAY_MS 1000
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Sina Mazaheri");
-MODULE_DESCRIPTION("LLM Provider Kernel Module");
-MODULE_VERSION("1.0");
-
-static char *api_key = "default-key";
-module_param(api_key, charp, 0660);
-MODULE_PARM_DESC(api_key, "API key for LLM provider");
-
-static char *provider = "openai";
-module_param(provider, charp, 0660);
-MODULE_PARM_DESC(provider, "LLM provider (openai, anthropic, etc.)");
-
-static char *model = "gpt-4";
-module_param(model, charp, 0660);
-MODULE_PARM_DESC(model, "Model name for the LLM provider");
-
-static struct llm_config *current_config;
-static struct socket *api_socket;
+/* Global state */
+static struct llm_config *global_config = NULL;
 static DEFINE_MUTEX(llm_mutex);
 
-
-/* Forward declarations for OpenAI functions */
-static int openai_init(struct llm_config *config);
-static void openai_cleanup(void);
-static int openai_send(const char *prompt, size_t length);
-static int openai_receive(struct llm_message *msg);
-
-/* Forward declarations for Anthropic functions */
-static int anthropic_init(struct llm_config *config);
-static void anthropic_cleanup(void);
-static int anthropic_send(const char *prompt, size_t length);
-static int anthropic_receive(struct llm_message *msg);
-
-/* Helper functions */
-static char *extract_content(const char *response);
-static int extract_status_code(const char *response);
-
-static int resolve_hostname(const char *hostname, __be32 *ip_addr)
-{
-    struct sockaddr_in *sin;
-    struct dns_lookup *lookup;
-    const char *end;
-    int ret;
-
-    /* Start DNS lookup */
-    lookup = dns_resolver_start(hostname, strlen(hostname), NULL, 0, NULL);
-    if (IS_ERR(lookup))
-        return PTR_ERR(lookup);
-
-    /* Wait for resolution */
-    ret = dns_resolver_wait(lookup);
-    if (ret < 0)
-        goto out;
-
-    /* Get first IP address */
-    sin = dns_lookup_result(lookup, &end);
-    if (!sin) {
-        ret = -ENOENT;
-        goto out;
-    }
-
-    *ip_addr = sin->sin_addr.s_addr;
-    ret = 0;
-
-    out:
-    dns_resolver_put(lookup);
-    return ret;
-}
-
-static int setup_tls(struct socket *sock)
-{
-    struct tls_context *ctx;
-    int ret;
-
-    /* Create TLS context */
-    ctx = tls_context_new(TLS_VERSION_1_3, TLS_ROLE_CLIENT);
-    if (IS_ERR(ctx))
-        return PTR_ERR(ctx);
-
-    /* Set TLS options */
-    ret = kernel_setsockopt(sock, SOL_TCP, TCP_ULP, "tls", sizeof("tls"));
-    if (ret < 0)
-        goto out_free_ctx;
-
-    /* Set TLS context */
-    ret = kernel_setsockopt(sock, SOL_TLS, TLS_TX, ctx, sizeof(*ctx));
-    if (ret < 0)
-        goto out_free_ctx;
-
-    return 0;
-
-    out_free_ctx:
-    tls_context_free(ctx);
-    return ret;
-}
-
-static struct llm_provider_ops providers[LLM_MAX_PROVIDERS] = {
-        [LLM_OPENAI] = {
-                .init = openai_init,
-                .cleanup = openai_cleanup,
-                .send = openai_send,
-                .receive = openai_receive,
-        },
-        [LLM_ANTHROPIC] = {
-                .init = anthropic_init,
-                .cleanup = anthropic_cleanup,
-                .send = anthropic_send,
-                .receive = anthropic_receive,
-        },
-        /* Add other providers similarly */
+/* JSON PARSING FUNCTIONS */
+/* JSON Token Types */
+enum json_token_type {
+    JSON_STRING,
+    JSON_NUMBER,
+    JSON_OBJECT_START,
+    JSON_OBJECT_END,
+    JSON_ARRAY_START,
+    JSON_ARRAY_END,
+    JSON_TRUE,
+    JSON_FALSE,
+    JSON_NULL,
+    JSON_COLON,
+    JSON_COMMA,
+    JSON_ERROR
 };
 
-/* In llm_module_init, use the module parameters to set the config fields */
-static int __init llm_module_init(void)
-{
-    struct llm_config config = {
-            .max_tokens = 1000,
-            .temperature_X100 = 70,
-            .use_ssl = true,
-            .timeout_ms = 30000
-    };
+struct json_token {
+    enum json_token_type type;
+    char *value;
+    size_t len;
+};
 
-    /* Copy the module parameters to the config */
-    strncpy(config.api_key, api_key, MAX_API_KEY_LENGTH - 1);
-    config.api_key[MAX_API_KEY_LENGTH - 1] = '\0';
+struct json_parser {
+    const char *input;
+    size_t pos;
+    size_t len;
+};
 
-    /* Map the provider string to enum. For example: */
-    if (strcmp(provider, "openai") == 0)
-        config.provider = LLM_OPENAI;
-    else if (strcmp(provider, "anthropic") == 0)
-        config.provider = LLM_ANTHROPIC;
-    else if (strcmp(provider, "mistral") == 0)
-        config.provider = LLM_MISTRAL;
-    else if (strcmp(provider, "huggingface") == 0)
-        config.provider = LLM_HUGGINGFACE;
-    else if (strcmp(provider, "gemini") == 0)
-        config.provider = LLM_GEMINI;
-    else
-        config.provider = LLM_OPENAI; /* default fallback */
 
-    strncpy(config.model, model, MAX_MODEL_NAME - 1);
-    config.model[MAX_MODEL_NAME - 1] = '\0';
+static int append_to_json(struct llm_json_buffer *buf, const char *str) {
+    size_t len;
 
-    return llm_init(&config);
+    if (!buf || !str || !buf->data)
+        return -EINVAL;
+
+    len = strlen(str);
+    if (buf->used + len + 1 > buf->size)
+        return -E2BIG;
+
+    memcpy(buf->data + buf->used, str, len);
+    buf->used += len;
+    buf->data[buf->used] = '\0';
+    return 0;
+}
+static int append_json_number(struct llm_json_buffer *buf, long long num) {
+    char number[32];
+    int ret;
+
+    ret = snprintf(number, sizeof(number), "%lld", num);
+    if (ret < 0 || ret >= sizeof(number))
+        return -EINVAL;
+
+    return append_to_json(buf, number);
 }
 
-static void __exit llm_module_exit(void)
-{
-    llm_cleanup();
+static int append_json_float(struct llm_json_buffer *buf, int value_X100) {
+    char number[32];
+    int ret;
+
+    ret = snprintf(number, sizeof(number), "%.2f",
+                  (float)value_X100 / 100.0f);
+    if (ret < 0 || ret >= sizeof(number))
+        return -EINVAL;
+
+    return append_to_json(buf, number);
 }
 
-module_init(llm_module_init);
-module_exit(llm_module_exit);
+/* JSON Parser */
+static void init_json_parser(struct json_parser *parser,
+                           const char *input, size_t len) {
+    parser->input = input;
+    parser->pos = 0;
+    parser->len = len;
+}
 
-/* OpenAI Implementation */
+static void skip_whitespace(struct json_parser *parser) {
+    while (parser->pos < parser->len &&
+           isspace(parser->input[parser->pos]))
+        parser->pos++;
+}
 
-static int openai_init(struct llm_config *config)
-{
-    struct sockaddr_in server = {0};
-    __be32 ip_addr;
-    struct timeval timeout;
-    int ret, retries = 0;
-    bool connected = false;
+void llm_json_buffer_free(struct llm_json_buffer *buf) {
+    if (!buf)
+        return;
 
-    /* Resolve OpenAI API hostname */
-    ret = resolve_hostname("api.openai.com", &ip_addr);
+    if (buf->data) {
+        memzero_explicit(buf->data, buf->size);
+        kfree(buf->data);
+    }
+    buf->data = NULL;
+    buf->size = 0;
+    buf->used = 0;
+}
+static inline struct llm_config *get_global_config(void) {
+    struct llm_config *config;
+    mutex_lock(&llm_mutex);
+    config = global_config;
+    mutex_unlock(&llm_mutex);
+    return config;
+}
+/* Safe string handling */
+static int json_unescape_string(const char *input, char *output, size_t outlen) {
+    size_t i, j = 0;
+
+    if (!input || !output || outlen < 2)
+        return -EINVAL;
+
+    for (i = 0; input[i] && j + 1 < outlen; i++) {
+        if (i >= strlen(input))  // Bounds check
+            return -EINVAL;
+
+        if (input[i] == '\\') {
+            i++;
+            if (i >= strlen(input))  // Check escape sequence
+                return -EINVAL;
+
+            switch(input[i]) {
+                case '"':
+                case '\\':
+                case '/':
+                    if (j + 1 >= outlen) return -E2BIG;
+                    output[j++] = input[i];
+                    break;
+                case 'u': {
+                    unsigned int codepoint;
+                    if (i + 4 >= strlen(input)) return -EINVAL;
+
+                    /* Safe hex conversion */
+                    if (hex2bin((u8 *)&codepoint, input + i + 1, 2) < 0)
+                        return -EINVAL;
+
+                    if (codepoint > 127)  // ASCII only
+                        return -EINVAL;
+
+                    if (j + 1 >= outlen) return -E2BIG;
+                    output[j++] = (char)codepoint;
+                    i += 4;
+                    break;
+                }
+                default:
+                    return -EINVAL;
+            }
+        } else {
+            if (j + 1 >= outlen) return -E2BIG;
+            output[j++] = input[i];
+        }
+    }
+
+    output[j] = '\0';
+    return j;
+}
+
+static int json_escape_string(const char *input, char *output, size_t outlen) {
+    size_t i, j = 0;
+
+    for (i = 0; input[i]; i++) {
+        if (j + 2 >= outlen) return -E2BIG;
+
+        switch (input[i]) {
+            case '"':
+                if (j + 2 >= outlen) return -E2BIG;
+                output[j++] = '\\';
+                output[j++] = '"';
+                break;
+            case '\\':
+                if (j + 2 >= outlen) return -E2BIG;
+                output[j++] = '\\';
+                output[j++] = '\\';
+                break;
+            case '\b':
+                if (j + 2 >= outlen) return -E2BIG;
+                output[j++] = '\\';
+                output[j++] = 'b';
+                break;
+            case '\f':
+                if (j + 2 >= outlen) return -E2BIG;
+                output[j++] = '\\';
+                output[j++] = 'f';
+                break;
+            case '\n':
+                if (j + 2 >= outlen) return -E2BIG;
+                output[j++] = '\\';
+                output[j++] = 'n';
+                break;
+            case '\r':
+                if (j + 2 >= outlen) return -E2BIG;
+                output[j++] = '\\';
+                output[j++] = 'r';
+                break;
+            case '\t':
+                if (j + 2 >= outlen) return -E2BIG;
+                output[j++] = '\\';
+                output[j++] = 't';
+                break;
+            default:
+                if (input[i] < 32) {
+                    if (j + 6 >= outlen) return -E2BIG;
+                    snprintf(&output[j], 7, "\\u%04x", input[i]);
+                    j += 6;
+                } else {
+                    output[j++] = input[i];
+                }
+        }
+    }
+
+    output[j] = '\0';
+    return j;
+}
+
+/* JSON Generation with validation */
+static int append_json_string(struct llm_json_buffer *buf, const char *str) {
+    char *escaped;
+    int ret;
+
+    escaped = kmalloc(strlen(str) * 6 + 1, GFP_KERNEL);
+    if (!escaped) return -ENOMEM;
+
+    ret = json_escape_string(str, escaped, strlen(str) * 6 + 1);
     if (ret < 0) {
-        pr_err("LLM: Failed to resolve api.openai.com: %d\n", ret);
+        kfree(escaped);
         return ret;
     }
+
+    ret = append_to_json(buf, escaped);
+    kfree(escaped);
+    return ret;
+}
+
+
+
+static struct json_token get_next_token(struct json_parser *parser) {
+    struct json_token token = {0};
+    char c;
+
+    skip_whitespace(parser);
+    if (parser->pos >= parser->len) {
+        token.type = JSON_ERROR;
+        return token;
+    }
+
+    c = parser->input[parser->pos++];
+    switch (c) {
+        case '{':
+            token.type = JSON_OBJECT_START;
+            break;
+        case '}':
+            token.type = JSON_OBJECT_END;
+            break;
+        case '[':
+            token.type = JSON_ARRAY_START;
+            break;
+        case ']':
+            token.type = JSON_ARRAY_END;
+            break;
+        case ':':
+            token.type = JSON_COLON;
+            break;
+        case ',':
+            token.type = JSON_COMMA;
+            break;
+        case '"': {
+            const char *start = &parser->input[parser->pos];
+            const char *end = start;
+            bool escaped = false;
+
+            while (parser->pos < parser->len) {
+                if (*end == '\\') {
+                    escaped = !escaped;
+                } else if (*end == '"' && !escaped) {
+                    break;
+                } else {
+                    escaped = false;
+                }
+                end++;
+                parser->pos++;
+            }
+
+            if (parser->pos >= parser->len) {
+                token.type = JSON_ERROR;
+                return token;
+            }
+
+            token.type = JSON_STRING;
+            token.value = (char *)start;
+            token.len = end - start;
+            parser->pos++; // Skip closing quote
+            break;
+        }
+        case 't':
+            if (parser->pos + 3 <= parser->len &&
+                strncmp(&parser->input[parser->pos-1], "true", 4) == 0) {
+                token.type = JSON_TRUE;
+                parser->pos += 3;
+            } else {
+                token.type = JSON_ERROR;
+            }
+            break;
+        case 'f':
+            if (parser->pos + 4 <= parser->len &&
+                strncmp(&parser->input[parser->pos-1], "false", 5) == 0) {
+                token.type = JSON_FALSE;
+                parser->pos += 4;
+            } else {
+                token.type = JSON_ERROR;
+            }
+            break;
+        case 'n':
+            if (parser->pos + 3 <= parser->len &&
+                strncmp(&parser->input[parser->pos-1], "null", 4) == 0) {
+                token.type = JSON_NULL;
+                parser->pos += 3;
+            } else {
+                token.type = JSON_ERROR;
+            }
+            break;
+        default:
+            if (isdigit(c) || c == '-') {
+                const char *start = &parser->input[parser->pos - 1];
+                const char *end = start;
+                bool has_decimal = false;
+
+                if (c == '-') {
+                    end++;
+                    parser->pos++;
+                }
+
+                while (parser->pos < parser->len &&
+                       (isdigit(parser->input[parser->pos]) ||
+                        parser->input[parser->pos] == '.')) {
+                    if (parser->input[parser->pos] == '.') {
+                        if (has_decimal) {
+                            token.type = JSON_ERROR;
+                            return token;
+                        }
+                        has_decimal = true;
+                    }
+                    end++;
+                    parser->pos++;
+                }
+
+                token.type = JSON_NUMBER;
+                token.value = (char *)start;
+                token.len = end - start;
+            } else {
+                token.type = JSON_ERROR;
+            }
+    }
+
+    return token;
+}
+static int format_request_json(struct llm_config *config,
+                             struct llm_message *msg,
+                             struct llm_json_buffer *buf) {
+    int ret;
+    bool locked = false;
+    struct llm_message *history_msg;
+
+    if (!buf || !config || !msg)
+        return -EINVAL;
+
+    ret = llm_json_buffer_init(buf, MAX_PROMPT_LENGTH);
+    if (ret)
+        return ret;
+
+    mutex_lock(&config->message_lock);
+    locked = true;
+
+    /* Start JSON object */
+    ret = append_to_json(buf, "{\"model\":\"");
+    if (ret)
+        goto cleanup;
+
+    ret = append_to_json(buf, config->model);
+    if (ret)
+        goto cleanup;
+
+    /* Add message history */
+    ret = append_to_json(buf, "\",\"messages\":[");
+    if (ret)
+        goto cleanup;
+
+    list_for_each_entry(history_msg, &config->message_history, list) {
+        ret = append_json_string(buf, history_msg->role);
+        if (ret)
+            goto cleanup;
+
+        ret = append_json_string(buf, history_msg->content);
+        if (ret)
+            goto cleanup;
+    }
+
+    mutex_unlock(&config->message_lock);
+    return 0;
+
+cleanup:
+    if (locked)
+        mutex_unlock(&config->message_lock);
+    llm_json_buffer_free(buf);
+    return ret;
+}
+/* Improved Response Parser */
+static int parse_json_value(struct json_parser *parser,
+                          const char *key,
+                          void *out,
+                          int type) {
+    struct json_token token;
+    char temp[256];
+    int ret = 0;
+
+    token = get_next_token(parser);
+    switch (type) {
+        case JSON_STRING:
+            if (token.type != JSON_STRING)
+                return -EINVAL;
+
+            if (token.len >= 256)
+                return -E2BIG;
+
+            memcpy(temp, token.value, token.len);
+            temp[token.len] = '\0';
+
+            ret = json_unescape_string(temp, out, 256);
+            break;
+
+        case JSON_NUMBER:
+            if (token.type != JSON_NUMBER)
+                return -EINVAL;
+
+            memcpy(temp, token.value, token.len);
+            temp[token.len] = '\0';
+
+            ret = kstrtoint(temp, 10, (int *)out);
+            break;
+
+        default:
+            return -EINVAL;
+    }
+
+    return ret;
+}
+//////////////////////////////////////////////////////////
+/* SSL Session Implementation */
+
+
+
+static int init_ssl_session(struct ssl_context *ssl) {
+    int ret;
+
+    if (!ssl || !ssl->tfm)
+        return -EINVAL;
+
+    /* Initialize crypto parameters */
+    ret = crypto_aead_setkey(ssl->tfm, ssl->key, ssl->key_size);
+    if (ret)
+        return ret;
+
+    /* Initialize scatterlists */
+    sg_init_table(ssl->sg_tx, 2);
+    sg_init_table(ssl->sg_rx, 2);
+
+    return 0;
+}
+
+/* Helper Functions */
+
+
+
+static int check_rate_limit(struct llm_config *config) {
+    unsigned long now = jiffies;
+    int ret = 0;
+    unsigned long old_reset;
+
+    spin_lock(&config->rate_limit.lock);
+    old_reset = atomic64_read(&config->rate_limit_reset);
+
+    if (time_after(now, old_reset)) {
+        atomic_set(&config->rate_limit.requests_remaining,
+                  config->max_requests_per_min);
+        atomic64_set(&config->rate_limit_reset, now + HZ * 60);
+    }
+
+    if (atomic_read(&config->rate_limit.requests_remaining) <= 0)
+        ret = -LLM_ERR_RATE_LIMIT;
+    else
+        atomic_dec(&config->rate_limit.requests_remaining);
+
+    spin_unlock(&config->rate_limit.lock);
+    return ret;
+}
+
+
+static int validate_message(const struct llm_message *msg)
+{
+    if (!msg || !msg->content)
+        return -EINVAL;
+
+    if (msg->content_length > MAX_PROMPT_LENGTH)
+        return -E2BIG;
+
+    /* Validate role */
+    if (strcmp(msg->role, ROLE_SYSTEM) != 0 &&
+        strcmp(msg->role, ROLE_USER) != 0 &&
+        strcmp(msg->role, ROLE_ASSISTANT) != 0 &&
+        strcmp(msg->role, ROLE_TOOL) != 0)
+        return -EINVAL;
+
+    return 0;
+}
+
+
+
+static void llm_message_cleanup(struct llm_message *msg)
+{
+    if (!msg)
+        return;
+
+    if (msg->content) {
+        memzero_explicit(msg->content, msg->content_length);
+        kfree(msg->content);
+    }
+    memzero_explicit(msg, sizeof(*msg));
+    kfree(msg);
+}
+
+static void cleanup_connection(struct llm_connection *conn) {
+    if (!conn) return;
+
+    if (conn->ssl_enabled && conn->ssl_context) {
+        struct ssl_context *ssl = conn->ssl_context;
+        crypto_free_aead(ssl->tfm);
+        kfree(ssl);
+    }
+
+    if (conn->sock) {
+        kernel_sock_shutdown(conn->sock, SHUT_RDWR);
+        sock_release(conn->sock);
+    }
+}
+static int establish_ssl_connection(struct llm_connection *conn) {
+    int ret;
+    struct ssl_context *ssl;
+
+    if (!conn)
+        return -EINVAL;
+
+    ssl = kzalloc(sizeof(*ssl), GFP_KERNEL);  // Use kzalloc for zero initialization
+    if (!ssl)
+        return -ENOMEM;
+
+    /* Initialize crypto with proper error handling */
+    ssl->tfm = crypto_alloc_aead("gcm(aes)", 0, CRYPTO_ALG_ASYNC);
+    if (IS_ERR(ssl->tfm)) {
+        ret = PTR_ERR(ssl->tfm);
+        goto cleanup_ssl;
+    }
+
+    /* Allocate scatterlists with boundary checks */
+    ssl->sg_tx = kcalloc(2, sizeof(struct scatterlist), GFP_KERNEL);
+    ssl->sg_rx = kcalloc(2, sizeof(struct scatterlist), GFP_KERNEL);
+    if (!ssl->sg_tx || !ssl->sg_rx) {
+        ret = -ENOMEM;
+        goto cleanup_crypto;
+    }
+
+    /* Initialize SSL session */
+    ret = init_ssl_session(ssl);
+    if (ret)
+        goto cleanup_all;
+
+    conn->ssl_context = ssl;
+    return 0;
+
+cleanup_all:
+    kfree(ssl->sg_tx);
+    kfree(ssl->sg_rx);
+cleanup_crypto:
+    crypto_free_aead(ssl->tfm);
+cleanup_ssl:
+    kfree(ssl);
+    return ret;
+}
+static int establish_connection(struct llm_config *config, struct llm_connection *conn) {
+    int ret;
+    struct sockaddr_in *addr = &conn->addr;
 
     /* Create socket */
-    ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &api_socket);
-    if (ret < 0) {
-        pr_err("LLM: Failed to create socket: %d\n", ret);
-        return ret;
+    ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &conn->sock);
+    if (ret < 0)
+        return -LLM_ERR_NETWORK_INIT;
+
+    /* Setup address */
+    memset(addr, 0, sizeof(*addr));
+    addr->sin_family = AF_INET;
+    addr->sin_port = htons(443);
+    ret = in4_pton(config->endpoint, strlen(config->endpoint),
+                   (u8 *)&addr->sin_addr.s_addr, -1, NULL);
+    if (ret != 1) {
+        ret = -LLM_ERR_NETWORK_INIT;
+        goto cleanup_socket;
     }
+
+    /* Connect with timeout */
+    ret = kernel_connect(conn->sock, (struct sockaddr *)addr,
+                        sizeof(*addr), O_NONBLOCK);
+    if (ret < 0 && ret != -EINPROGRESS) {
+        ret = -LLM_ERR_NETWORK_CONN;
+        goto cleanup_socket;
+    }
+
+    /* Setup SSL if enabled */
+    if (config->use_ssl) {
+        ret = establish_ssl_connection(conn);
+        if (ret) {
+            ret = -LLM_ERR_SSL;
+            goto cleanup_socket;
+        }
+    }
+
+    return 0;
+
+cleanup_socket:
+    sock_release(conn->sock);
+    return ret;
+}
+static int establish_connection_with_timeout(struct llm_config *config,
+                                           struct llm_connection *conn) {
+    int ret;
+    unsigned long timeout = msecs_to_jiffies(config->timeout_ms);
+    struct socket *sock = conn->sock;
 
     /* Set socket timeout */
-    timeout.tv_sec = LLM_CONNECT_TIMEOUT_MS / 1000;
-    timeout.tv_usec = (LLM_CONNECT_TIMEOUT_MS % 1000) * 1000;
-    ret = kernel_setsockopt(api_socket, SOL_SOCKET, SO_RCVTIMEO,
-                            (char *)&timeout, sizeof(timeout));
-    if (ret < 0)
-        pr_warn("LLM: Failed to set receive timeout\n");
-
-    /* Set up server address */
-    server.sin_family = AF_INET;
-    server.sin_port = htons(443);
-    server.sin_addr.s_addr = ip_addr;
-
-    /* Connection retry loop */
-    while (retries < LLM_MAX_RETRIES && !connected) {
-        ret = kernel_connect(api_socket, (struct sockaddr *)&server,
-                             sizeof(server), O_NONBLOCK);
-        if (ret == 0) {
-            connected = true;
-            break;
-        }
-
-        if (ret != -EINPROGRESS) {
-            retries++;
-            if (retries < LLM_MAX_RETRIES) {
-                pr_warn("LLM: Connection failed, retry %d/%d\n",
-                        retries, LLM_MAX_RETRIES);
-                msleep(LLM_RETRY_DELAY_MS);
-                continue;
-            }
-            goto err_connect;
-        }
-
-        /* Wait for connection completion */
-        ret = wait_for_connection(api_socket, LLM_CONNECT_TIMEOUT_MS);
-        if (ret == 0) {
-            connected = true;
-            break;
-        }
-
-        retries++;
-        if (retries < LLM_MAX_RETRIES) {
-            pr_warn("LLM: Connection timeout, retry %d/%d\n",
-                    retries, LLM_MAX_RETRIES);
-            msleep(LLM_RETRY_DELAY_MS);
-        }
-    }
-
-    if (!connected) {
-        pr_err("LLM: Failed to connect after %d retries\n", LLM_MAX_RETRIES);
-        goto err_connect;
-    }
-
-    /* Setup TLS */
-    ret = setup_tls(api_socket);
-    if (ret < 0) {
-        pr_err("LLM: Failed to setup TLS: %d\n", ret);
-        goto err_tls;
-    }
-
-    pr_info("LLM: Successfully connected to OpenAI (TLS enabled)\n");
-    return 0;
-
-    err_tls:
-    kernel_sock_shutdown(api_socket, SHUT_RDWR);
-    err_connect:
-    sock_release(api_socket);
-    api_socket = NULL;
-    return ret;
-}
-
-/* Helper function for nonblocking connect */
-static int wait_for_connection(struct socket *sock, int timeout_ms)
-{
-    struct timeval tv;
-    fd_set write_fds;
-    int ret;
-
-    FD_ZERO(&write_fds);
-    FD_SET(sock->file->f_inode->i_rdev, &write_fds);
-
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    ret = sock_select(sock->file->f_inode->i_rdev + 1, NULL, &write_fds,
-                      NULL, &tv);
-    if (ret < 0)
-        return ret;
-    if (ret == 0)
-        return -ETIMEDOUT;
-    return 0;
-}
-
-static void openai_cleanup(void)
-{
-    if (api_socket) {
-        kernel_sock_shutdown(api_socket, SHUT_RDWR);
-        sock_release(api_socket);
-        api_socket = NULL;
-    }
-}
-
-static int openai_send(const char *prompt, size_t length)
-{
-    struct kvec iov;
-    struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
-    char *request;
-    int ret;
-    size_t body_len;
-    size_t model_len = strnlen(current_config->model, MAX_MODEL_NAME);
-
-    /*
-     * Calculate the length of the JSON body:
-     * JSON body format: {"model":"%s","messages":[{"role":"user","content":"%s"}]}
-     *
-     * Counting chars:
-     * "{\"model\":\"" -> 10 chars
-     * model -> model_len chars
-     * "\",\"messages\":[{\"role\":\"user\",\"content\":\"" -> 40 chars
-     * prompt -> length chars
-     * "\"}]}" -> 4 chars
-     * Total = 10 + model_len + 40 + length + 4 = length + model_len + 54
-     */
-    body_len = length + model_len + 54;
-
-    /* Allocate request buffer */
-    request = kmalloc(body_len + 1024, GFP_KERNEL); // 1024 for headers & safety
-    if (!request)
-        return -ENOMEM;
-
-    /*
-     * Construct the HTTP request:
-     * Remember:
-     * - Headers end with "\r\n\r\n"
-     * - Then the JSON body follows
-     */
-    snprintf(request, body_len + 1024,
-             "POST /v1/chat/completions HTTP/1.1\r\n"
-             "Host: api.openai.com\r\n"
-             "Authorization: Bearer %s\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %zu\r\n"
-             "\r\n"
-             "{\"model\":\"%s\",\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
-             current_config->api_key,
-             body_len,
-             current_config->model,
-             prompt);
-
-    iov.iov_base = request;
-    iov.iov_len = strlen(request);
-    ret = kernel_sendmsg(api_socket, &msg, &iov, 1, iov.iov_len);
-
-    kfree(request);
-    return ret;
-}
-
-static int openai_receive(struct llm_message *msg)
-{
-    struct kvec iov;
-    struct msghdr recv_msg = { .msg_flags = MSG_DONTWAIT };
-    char *response;
-    int ret;
-
-    response = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
-    if (!response)
-        return -ENOMEM;
-
-    iov.iov_base = response;
-    iov.iov_len = MAX_RESPONSE_LENGTH - 1;
-    ret = kernel_recvmsg(api_socket, &recv_msg, &iov, 1, iov.iov_len, recv_msg.msg_flags);
-
-    if (ret > 0) {
-        response[ret] = '\0';
-        msg->status_code = extract_status_code(response);
-        msg->content = extract_content(response);
-        if (msg->content)
-            msg->length = strlen(msg->content);
-        else
-            msg->length = 0;
-    } else {
-        msg->status_code = ret < 0 ? ret : 0;
-        msg->content = NULL;
-        msg->length = 0;
-    }
-
-    /* The msg->content memory is separately allocated by extract_content(), if any */
-    kfree(response);
-    return ret;
-}
-
-static char *extract_content(const char *response)
-{
-    char *content;
-    const char *start, *end;
-    size_t length;
-
-    /* Find content in JSON response */
-    start = strstr(response, "\"content\":\"");
-    if (!start)
-        return NULL;
-
-    start += strlen("\"content\":\"");  // move past the content start
-    end = strchr(start, '\"');
-    if (!end)
-        return NULL;
-
-    length = end - start;
-    content = kmalloc(length + 1, GFP_KERNEL);
-    if (!content)
-        return NULL;
-
-    memcpy(content, start, length);
-    content[length] = '\0';
-    return content;
-}
-
-static int extract_status_code(const char *response)
-{
-    const char *p;
-    char status_str[4] = {0}; // HTTP status code is 3 digits typically
-    int status;
-
-    p = strstr(response, "HTTP/1.1");
-    if (!p)
-        return -1;
-
-    p = strchr(p, ' ');
-    if (!p)
-        return -1;
-    p++;
-
-    /*
-     * Copy up to three digits of the status code.
-     * Example: "200 OK" -> status_str = "200"
-     */
-    strncpy(status_str, p, 3);
-    status_str[3] = '\0';
-
-    if (kstrtoint(status_str, 10, &status) < 0)
-        return -1;
-
-    return status;
-}
-
-/* Anthropic Provider Stub */
-static int anthropic_init(struct llm_config *config) {
-    struct sockaddr_in server = {0};
-    int ret;
-
-    ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &api_socket);
+    ret = sock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+                         (char *)&timeout, sizeof(timeout));
     if (ret < 0)
         return ret;
 
-    server.sin_family = AF_INET;
-    server.sin_port = htons(443);
-
-    /* Replace with a known IP or implement DNS resolution.
-       For demonstration, we use example.com IP again (93.184.216.34).
-       In real usage, you'd need the actual IP of api.anthropic.com or DNS resolution. */
-    server.sin_addr.s_addr = in_aton("93.184.216.34");
-
-    ret = kernel_connect(api_socket, (struct sockaddr *)&server, sizeof(server), 0);
-    if (ret < 0) {
-        sock_release(api_socket);
-        api_socket = NULL;
+    ret = sock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                         (char *)&timeout, sizeof(timeout));
+    if (ret < 0)
         return ret;
-    }
+
+    /* Modify establish_connection to use timeout */
+    ret = establish_connection(config, conn);
+    if (ret)
+        return ret;
 
     return 0;
 }
-
-static void anthropic_cleanup(void) {
-    if (api_socket) {
-        kernel_sock_shutdown(api_socket, SHUT_RDWR);
-        sock_release(api_socket);
-        api_socket = NULL;
-    }
-}
-
-/* Anthropics send:
- * Use Anthropic-Key header instead of Authorization, and POST /v1/complete.
- * JSON body fields: prompt, model, max_tokens_to_sample, temperature, etc.
- */
-static int anthropic_send(const char *prompt, size_t length)
-{
-    struct kvec iov;
-    struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
-    char *request;
-    char *body;
+static int send_http_request(struct llm_connection *conn,
+                           struct llm_json_buffer *buf) {
+    struct msghdr msg = {0};
+    struct kvec iov[2];
+    char headers[512];
     int ret;
-    size_t prompt_len = length;
-    int max_tokens = current_config->max_tokens > 0 ? current_config->max_tokens : 300;
 
-    body = kmalloc(2048, GFP_KERNEL);
-    if (!body)
-        return -ENOMEM;
+    ret = snprintf(headers, sizeof(headers),
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: api.openai.com\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n", buf->used);
 
-    // Since we no longer use floating point, temperature_x100 is already an int.
-    int temp_int = current_config->temperature_X100;
+    if (ret >= sizeof(headers))
+        return -EOVERFLOW;
 
-    int body_used = snprintf(body, 2048,
-                             "{\"prompt\":\"%.*s\",\"model\":\"%s\",\"max_tokens_to_sample\":%d,"
-                             "\"temperature\":%d.%02d,\"stop_sequences\":[\"\\n\\nHuman:\"]}",
-                             (int)prompt_len, prompt,
-                             current_config->model,
-                             max_tokens,
-                             temp_int / 100, temp_int % 100
-    );
+    iov[0].iov_base = headers;
+    iov[0].iov_len = ret;
+    iov[1].iov_base = buf->data;
+    iov[1].iov_len = buf->used;
 
-    if (body_used < 0 || body_used >= 2048) {
-        kfree(body);
+    ret = kernel_sendmsg(conn->sock, &msg, iov, 2, ret + buf->used);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+static int receive_http_response(struct llm_connection *conn,
+                               struct llm_response *resp,
+                               char *buffer,
+                               size_t buffer_size) {
+    struct msghdr msg = {0};
+    struct kvec iov;
+    int ret, received = 0;
+    bool headers_complete = false;
+    long timeout = msecs_to_jiffies(conn->timeout_ms);
+
+    if (!conn || !resp || !buffer || buffer_size < 1)
         return -EINVAL;
-    }
 
-    request = kmalloc(body_used + 1024, GFP_KERNEL);
-    if (!request) {
-        kfree(body);
-        return -ENOMEM;
-    }
+    while (received < buffer_size - 1) {
+        /* Set socket timeout */
+        ret = sock_setsockopt(conn->sock, SOL_SOCKET, SO_RCVTIMEO,
+                             (char *)&timeout, sizeof(timeout));
+        if (ret < 0)
+            return ret;
 
-    int header_len = snprintf(request, body_used + 1024,
-                              "POST /v1/complete HTTP/1.1\r\n"
-                              "Host: api.anthropic.com\r\n"
-                              "Anthropic-Key: %s\r\n"
-                              "Content-Type: application/json\r\n"
-                              "Content-Length: %d\r\n"
-                              "\r\n",
-                              current_config->api_key,
-                              body_used
-    );
+        iov.iov_base = buffer + received;
+        iov.iov_len = min_t(size_t, buffer_size - received - 1, PAGE_SIZE);
 
-    if (header_len < 0 || header_len >= (int)(body_used + 1024)) {
-        kfree(body);
-        kfree(request);
-        return -EINVAL;
-    }
+        ret = kernel_recvmsg(conn->sock, &msg, &iov, 1, iov.iov_len, 0);
+        if (ret <= 0) {
+            if (ret == -EAGAIN)
+                return -LLM_ERR_TIMEOUT;
+            return ret ? ret : -ECONNRESET;
+        }
 
-    memcpy(request + header_len, body, body_used);
-    request[header_len + body_used] = '\0';
+        received += ret;
+        buffer[received] = '\0';
 
-    kfree(body);
+        /* Process headers and body */
+        if (!headers_complete && received > 4) {
+            char *body = strstr(buffer, "\r\n\r\n");
+            if (body) {
+                headers_complete = true;
+                /* Validate response code */
+                if (sscanf(buffer, "HTTP/1.1 %d", &resp->status_code) != 1)
+                    return -LLM_ERR_API_RESPONSE;
 
-    iov.iov_base = request;
-    iov.iov_len = header_len + body_used;
-    ret = kernel_sendmsg(api_socket, &msg, &iov, 1, iov.iov_len);
+                if (resp->status_code < 200 || resp->status_code >= 300)
+                    return -LLM_ERR_API_RESPONSE;
 
-    kfree(request);
-    return ret;
-}
-
-/* Anthropics receive:
- * The response should have "completion":"<text>" in JSON.
- * We'll parse similarly to extract_content(), but look for "completion":".
- */
-
-static int anthropic_receive(struct llm_message *msg)
-{
-    struct kvec iov;
-    struct msghdr recv_msg = { .msg_flags = MSG_DONTWAIT };
-    char *response;
-    int ret;
-
-    response = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
-    if (!response)
-        return -ENOMEM;
-
-    iov.iov_base = response;
-    iov.iov_len = MAX_RESPONSE_LENGTH - 1;
-    ret = kernel_recvmsg(api_socket, &recv_msg, &iov, 1, iov.iov_len, recv_msg.msg_flags);
-    if (ret > 0) {
-        response[ret] = '\0';
-        msg->status_code = extract_status_code(response);
-        msg->content = NULL;
-        msg->length = 0;
-
-        /* Extract "completion":"...". Similar logic to extract_content(). */
-        {
-            const char *start = strstr(response, "\"completion\":\"");
-            if (start) {
-                start += strlen("\"completion\":\"");
-                const char *end = strchr(start, '\"');
-                if (end) {
-                    size_t length = end - start;
-                    char *completion = kmalloc(length + 1, GFP_KERNEL);
-                    if (completion) {
-                        memcpy(completion, start, length);
-                        completion[length] = '\0';
-                        msg->content = completion;
-                        msg->length = length;
-                    }
-                }
+                /* Process body */
+                size_t header_len = (body - buffer) + 4;
+                memmove(buffer, body + 4, received - header_len);
+                received -= header_len;
             }
         }
-    } else {
-        msg->status_code = ret < 0 ? ret : 0;
-        msg->content = NULL;
-        msg->length = 0;
+
+        /* Check for complete response */
+        if (headers_complete && strchr(buffer, '}'))
+            break;
     }
 
-    kfree(response);
-    return ret;
+    if (received >= buffer_size - 1)
+        return -E2BIG;
+
+    return received;
+}
+static void cleanup_message_history(struct llm_config *config)
+{
+    struct llm_message *msg, *tmp;
+
+    list_for_each_entry_safe(msg, tmp, &config->message_history, list) {
+        list_del(&msg->list);
+        llm_message_free(msg);
+    }
 }
 
-/* Main interface functions */
+static void cleanup_tools(struct llm_config *config)
+{
+    struct llm_tool *tool, *tmp_tool;
+    struct llm_tool_param *param, *tmp_param;
 
+    list_for_each_entry_safe(tool, tmp_tool, &config->tools, list) {
+        list_for_each_entry_safe(param, tmp_param, &tool->parameters, list) {
+            list_del(&param->list);
+            kfree(param);
+        }
+        list_del(&tool->list);
+        llm_tool_free(tool);
+    }
+}
+
+/* Message Management */
+struct llm_message *llm_message_alloc(const char *role, const char *content)
+{
+    struct llm_message *msg;
+    size_t content_len;
+
+    if (!role || !content)
+        return NULL;
+
+    msg = kmalloc(sizeof(*msg), GFP_KERNEL);
+    if (!msg)
+        return NULL;
+
+    /* Initialize role */
+    strncpy(msg->role, role, MAX_ROLE_LENGTH - 1);
+    msg->role[MAX_ROLE_LENGTH - 1] = '\0';
+
+    /* Allocate and copy content */
+    content_len = strlen(content) + 1;
+    msg->content = kmalloc(content_len, GFP_KERNEL);
+    if (!msg->content) {
+        kfree(msg);
+        return NULL;
+    }
+
+    strncpy(msg->content, content, content_len);
+    msg->content_length = content_len - 1;
+    INIT_LIST_HEAD(&msg->list);
+
+    return msg;
+}
+
+void llm_message_free(struct llm_message *msg)
+{
+    if (!msg)
+        return;
+
+    if (msg->content)
+        kfree(msg->content);
+    kfree(msg);
+}
+
+int llm_add_message(struct llm_config *config, struct llm_message *msg) {
+    if (!config || !msg)
+        return -EINVAL;
+
+    mutex_lock(&config->message_lock);
+    list_add_tail(&msg->list, &config->message_history);
+    mutex_unlock(&config->message_lock);
+    return 0;
+}
+
+/* Tool Management */
+struct llm_tool *llm_tool_alloc(const char *name, const char *description)
+{
+    struct llm_tool *tool;
+
+    if (!name || !description)
+        return NULL;
+
+    tool = kmalloc(sizeof(*tool), GFP_KERNEL);
+    if (!tool)
+        return NULL;
+
+    strncpy(tool->name, name, MAX_TOOL_NAME - 1);
+    tool->name[MAX_TOOL_NAME - 1] = '\0';
+
+    strncpy(tool->description, description, MAX_TOOL_DESC - 1);
+    tool->description[MAX_TOOL_DESC - 1] = '\0';
+
+    INIT_LIST_HEAD(&tool->parameters);
+    INIT_LIST_HEAD(&tool->list);
+
+    return tool;
+}
+
+void llm_tool_free(struct llm_tool *tool)
+{
+    struct llm_tool_param *param, *tmp;
+
+    if (!tool)
+        return;
+
+    list_for_each_entry_safe(param, tmp, &tool->parameters, list) {
+        list_del(&param->list);
+        kfree(param);
+    }
+
+    kfree(tool);
+}
+
+int llm_add_tool_param(struct llm_tool *tool, const char *name,
+                      const char *description, bool required)
+{
+    struct llm_tool_param *param;
+
+    if (!tool || !name || !description)
+        return -EINVAL;
+
+    param = kmalloc(sizeof(*param), GFP_KERNEL);
+    if (!param)
+        return -ENOMEM;
+
+    strncpy(param->name, name, MAX_TOOL_NAME - 1);
+    param->name[MAX_TOOL_NAME - 1] = '\0';
+
+    strncpy(param->description, description, MAX_TOOL_DESC - 1);
+    param->description[MAX_TOOL_DESC - 1] = '\0';
+
+    param->required = required;
+    INIT_LIST_HEAD(&param->list);
+
+    list_add_tail(&param->list, &tool->parameters);
+    return 0;
+}
+
+/* Replace global mutex with config-specific locks */
+int llm_add_tool(struct llm_config *config, struct llm_tool *tool) {
+    if (!config || !tool)
+        return -EINVAL;
+
+    mutex_lock(&config->tool_lock);
+    list_add_tail(&tool->list, &config->tools);
+    mutex_unlock(&config->tool_lock);
+    return 0;
+}
+
+/* Main Interface Implementation */
 int llm_init(struct llm_config *config)
 {
-    int ret;
-
-    if (!config || config->provider >= LLM_MAX_PROVIDERS)
+    if (!config)
         return -EINVAL;
 
     mutex_lock(&llm_mutex);
 
-    current_config = kmalloc(sizeof(*current_config), GFP_KERNEL);
-    if (!current_config) {
+    if (global_config) {
         mutex_unlock(&llm_mutex);
-        return -ENOMEM;
+        return -EBUSY;
     }
 
-    memcpy(current_config, config, sizeof(*current_config));
+    /* Initialize lists */
+    INIT_LIST_HEAD(&config->message_history);
+    INIT_LIST_HEAD(&config->tools);
 
-    if (providers[config->provider].init) {
-        ret = providers[config->provider].init(config);
-        if (ret < 0) {
-            kfree(current_config);
-            current_config = NULL;
-            mutex_unlock(&llm_mutex);
-            return ret;
-        }
-    }
+    /* Set defaults */
+    config->max_tokens = 2048;
+    config->temperature_X100 = 70;  /* 0.7 */
+    config->top_p_X100 = 100;      /* 1.0 */
+    config->n_choices = 1;
+    config->stream = false;
+    config->presence_penalty_X100 = 0;
+    config->frequency_penalty_X100 = 0;
+    config->use_ssl = true;
+    config->timeout_ms = 30000;
+    config->max_requests_per_min = 60;
+    config->remaining_requests = 60;
+    config->rate_limit_reset = jiffies + HZ * 60;
 
+    global_config = config;
     mutex_unlock(&llm_mutex);
+
+    pr_info("LLM: Initialized with model %s\n", config->model);
     return 0;
 }
 
@@ -644,55 +944,111 @@ void llm_cleanup(void)
 {
     mutex_lock(&llm_mutex);
 
-    if (current_config && providers[current_config->provider].cleanup)
-        providers[current_config->provider].cleanup();
-
-    kfree(current_config);
-    current_config = NULL;
-
-    mutex_unlock(&llm_mutex);
-}
-
-int llm_send(const char *prompt, size_t length)
-{
-    int ret;
-
-    if (!prompt || !length || length > MAX_PROMPT_LENGTH)
-        return -EINVAL;
-
-    mutex_lock(&llm_mutex);
-
-    if (!current_config || !providers[current_config->provider].send) {
-        mutex_unlock(&llm_mutex);
-        return -EINVAL;
+    if (global_config) {
+        cleanup_message_history(global_config);
+        cleanup_tools(global_config);
+        global_config = NULL;
     }
 
-    ret = providers[current_config->provider].send(prompt, length);
-
     mutex_unlock(&llm_mutex);
+    pr_info("LLM: Cleanup complete\n");
+}
+
+/* Message Sending and Response Handling */
+int llm_send_message(struct llm_config *config, struct llm_message *msg)
+{
+    struct llm_connection conn;
+    struct llm_json_buffer req_buf;
+    int ret;
+
+    if (!config || !msg)
+        return -EINVAL;
+
+    ret = validate_message(msg);
+    if (ret != 0)
+        return ret;
+
+    /* Check rate limiting */
+    if (check_rate_limit(config) != 0)
+        return -LLM_ERR_RATE_LIMIT;
+
+    /* Format JSON request */
+    ret = format_request_json(config, msg, &req_buf);
+    if (ret != 0)
+        return ret;
+
+    /* Establish connection */
+    ret = establish_connection(config, &conn);
+    if (ret != 0)
+        goto out_free_json;
+
+    /* Send HTTP request */
+    ret = send_http_request(&conn, &req_buf);
+    if (ret != 0)
+        goto out_close_conn;
+
+    /* Cleanup */
+    cleanup_connection(&conn);
+    free_json_buffer(&req_buf);
+    return 0;
+
+    out_close_conn:
+        cleanup_connection(&conn);
+    out_free_json:
+        free_json_buffer(&req_buf);
     return ret;
 }
 
-int llm_receive(struct llm_message *msg)
-{
+int llm_receive_response(struct llm_config *config, struct llm_response *resp) {
+    struct llm_connection conn;
+    char *buffer;
     int ret;
 
-    if (!msg)
+    if (!config || !resp)
         return -EINVAL;
 
-    mutex_lock(&llm_mutex);
+    buffer = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
+    if (!buffer)
+        return -ENOMEM;
 
-    if (!current_config || !providers[current_config->provider].receive) {
-        mutex_unlock(&llm_mutex);
-        return -EINVAL;
-    }
+    /* Establish connection */
+    ret = establish_connection(config, &conn);
+    if (ret)
+        goto cleanup_buffer;
 
-    ret = providers[current_config->provider].receive(msg);
+    /* Receive response with timeout */
+    ret = receive_http_response(&conn, resp, buffer, MAX_RESPONSE_LENGTH);
+    if (ret < 0)
+        goto cleanup_conn;
 
-    mutex_unlock(&llm_mutex);
+    /* Parse JSON response */
+    ret = parse_json_response(buffer, ret, resp);
+
+cleanup_conn:
+    cleanup_connection(&conn);
+cleanup_buffer:
+    memzero_explicit(buffer, MAX_RESPONSE_LENGTH);
+    kfree(buffer);
     return ret;
 }
 
-/* Helper Functions */
+/* Module initialization and cleanup */
+static int __init llm_provider_init(void)
+{
+    pr_info("LLM: Provider module loaded\n");
+    return 0;
+}
 
+static void __exit llm_provider_exit(void)
+{
+    llm_cleanup();
+    pr_info("LLM: Provider module unloaded\n");
+}
 
+module_init(llm_provider_init);
+module_exit(llm_provider_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Sina Mazaheri");
+MODULE_DESCRIPTION("OpenAI LLM Provider Implementation");
+MODULE_VERSION("1.0");

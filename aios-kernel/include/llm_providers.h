@@ -353,7 +353,6 @@ static inline int llm_json_buffer_init(struct llm_json_buffer *buf, size_t size)
 }
 void llm_json_buffer_free(struct llm_json_buffer *buf);
 int llm_json_buffer_append(struct llm_json_buffer *buf, const char *str);
-static inline void llm_config_put(struct llm_config *config);
 
 /* Function declarations */
 /**
