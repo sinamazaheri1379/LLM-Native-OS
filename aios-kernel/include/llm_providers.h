@@ -92,7 +92,7 @@ LLM_VALID_API_KEY((x)->api_key))
 /* Version information */
 #define LLM_API_VERSION_MAJOR  1
 #define LLM_API_VERSION_MINOR  0
-
+#define OPENAI_API_KEY_ENV "OPENAI_API_KEY"
 /**
  * Locking rules:
  * - config_lock protects configuration parameters
@@ -114,6 +114,10 @@ typedef struct llm_ssl_context llm_ssl_context_t;
  * @major: Major version number
  * @minor: Minor version number
  */
+
+
+
+
 struct llm_version {
     uint16_t major;
     uint16_t minor;
@@ -212,6 +216,23 @@ struct llm_response {
 /**
  * struct llm_config - Enhanced configuration for OpenAI
  */
+struct ssl_context {
+    struct crypto_aead *tfm;
+    u8 *key;
+    u8 *iv;
+    size_t key_size;
+    size_t iv_size;
+    struct scatterlist *sg_tx;
+    struct scatterlist *sg_rx;
+    struct aead_request *req;
+    bool handshake_complete;
+    struct {
+        u8 *data;
+        size_t size;
+    } session;
+};
+
+
 struct llm_config {
     /* Authentication */
     struct llm_version version;
@@ -323,6 +344,8 @@ static inline void llm_config_cleanup(struct llm_config *config) {
     mutex_destroy(&config->config_lock);
 }
 
+int llm_set_api_key(struct llm_config *config, const char *api_key);
+int llm_load_api_key_from_env(struct llm_config *config);
 /* Complete the config_put implementation */
 static inline void llm_config_put(struct llm_config *config) {
     if (!config)

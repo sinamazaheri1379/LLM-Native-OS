@@ -1,3 +1,4 @@
+#include <linux/moduleparam.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
@@ -5,7 +6,34 @@
 #include <linux/mutex.h>
 #include <linux/list.h>
 #include <linux/jiffies.h>
+#include <linux/device.h>
+#include <linux/fs.h>
 #include "llm_providers.h"
+
+static int major_number;
+static struct class *llm_class;
+static struct device *llm_device;
+
+#define DEVICE_NAME "llm"
+
+/* Device operations */
+static int llm_open(struct inode *inode, struct file *file);
+static int llm_release(struct inode *inode, struct file *file);
+static ssize_t llm_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
+static ssize_t llm_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
+
+static struct file_operations fops = {
+    .open = llm_open,
+    .read = llm_read,
+    .write = llm_write,
+    .release = llm_release
+};
+
+
+
+static char *api_key = NULL;
+module_param(api_key, charp, 0600);
+MODULE_PARM_DESC(api_key, "OpenAI API Key");
 
 /* Global state */
 static struct llm_config *global_config = NULL;
@@ -409,12 +437,11 @@ static int format_request_json(struct llm_config *config,
 
     if (!buf || !config || !msg)
         return -EINVAL;
+
     if (!LLM_VALID_MAX_TOKENS(config->max_tokens) ||
         !LLM_VALID_TEMP_RANGE(config->temperature_X100))
         return -EINVAL;
 
-    if (!config->model[0] || strlen(config->model) >= MAX_MODEL_NAME)
-        return -EINVAL;
     ret = llm_json_buffer_init(buf, MAX_PROMPT_LENGTH);
     if (ret)
         return ret;
@@ -422,7 +449,6 @@ static int format_request_json(struct llm_config *config,
     mutex_lock(&config->message_lock);
     locked = true;
 
-    /* Start JSON object */
     ret = append_to_json(buf, "{\"model\":\"");
     if (ret)
         goto cleanup;
@@ -431,7 +457,6 @@ static int format_request_json(struct llm_config *config,
     if (ret)
         goto cleanup;
 
-    /* Add message history */
     ret = append_to_json(buf, "\",\"messages\":[");
     if (ret)
         goto cleanup;
@@ -445,6 +470,19 @@ static int format_request_json(struct llm_config *config,
         if (ret)
             goto cleanup;
     }
+
+    /* Add current message */
+    ret = append_json_string(buf, msg->role);
+    if (ret)
+        goto cleanup;
+
+    ret = append_json_string(buf, msg->content);
+    if (ret)
+        goto cleanup;
+
+    ret = append_to_json(buf, "]}");
+    if (ret)
+        goto cleanup;
 
     mutex_unlock(&config->message_lock);
     return 0;
@@ -507,27 +545,163 @@ static int parse_json_value(struct json_parser *parser,
 
     return ret;
 }
+
+static int parse_usage_object(struct json_parser *parser,
+                            struct llm_response_usage *usage) {
+    struct json_token token;
+    int ret;
+
+    while ((token = get_next_token(parser)).type != JSON_OBJECT_END) {
+        if (token.type != JSON_STRING)
+            return -LLM_ERR_JSON_PARSE;
+
+        char key[64];
+        if (token.len >= sizeof(key))
+            return -E2BIG;
+
+        memcpy(key, token.value, token.len);
+        key[token.len] = '\0';
+
+        token = get_next_token(parser);
+        if (token.type != JSON_COLON)
+            return -LLM_ERR_JSON_PARSE;
+
+        if (strcmp(key, "prompt_tokens") == 0) {
+            ret = parse_json_value(parser, key, &usage->prompt_tokens, JSON_NUMBER);
+            if (ret < 0)
+                return ret;
+        } else if (strcmp(key, "completion_tokens") == 0) {
+            ret = parse_json_value(parser, key, &usage->completion_tokens, JSON_NUMBER);
+            if (ret < 0)
+                return ret;
+        } else if (strcmp(key, "total_tokens") == 0) {
+            ret = parse_json_value(parser, key, &usage->total_tokens, JSON_NUMBER);
+            if (ret < 0)
+                return ret;
+        }
+    }
+
+    return 0;
+}
+
+static int parse_json_response(const char *buffer, size_t len, struct llm_response *resp) {
+    struct json_parser parser;
+    int ret;
+
+    if (!buffer || !resp || len == 0)
+        return -EINVAL;
+
+    init_json_parser(&parser, buffer, len);
+
+    /* Find start of JSON object */
+    struct json_token token = get_next_token(&parser);
+    if (token.type != JSON_OBJECT_START)
+        return -LLM_ERR_JSON_PARSE;
+
+    /* Parse response fields */
+    while ((token = get_next_token(&parser)).type != JSON_OBJECT_END) {
+        if (token.type != JSON_STRING)
+            return -LLM_ERR_JSON_PARSE;
+
+        char key[256];
+        if (token.len >= sizeof(key))
+            return -E2BIG;
+
+        memcpy(key, token.value, token.len);
+        key[token.len] = '\0';
+
+        token = get_next_token(&parser);
+        if (token.type != JSON_COLON)
+            return -LLM_ERR_JSON_PARSE;
+
+        if (strcmp(key, "id") == 0) {
+            ret = parse_json_value(&parser, key, resp->id, JSON_STRING);
+            if (ret < 0)
+                return ret;
+        } else if (strcmp(key, "model") == 0) {
+            ret = parse_json_value(&parser, key, resp->model, JSON_STRING);
+            if (ret < 0)
+                return ret;
+        } else if (strcmp(key, "usage") == 0) {
+            /* Parse usage object */
+            token = get_next_token(&parser);
+            if (token.type != JSON_OBJECT_START)
+                return -LLM_ERR_JSON_PARSE;
+
+            ret = parse_usage_object(&parser, &resp->usage);
+            if (ret < 0)
+                return ret;
+        }
+    }
+
+    return 0;
+}
 //////////////////////////////////////////////////////////
 /* SSL Session Implementation */
 
 
-
 static int init_ssl_session(struct ssl_context *ssl) {
     int ret;
+    struct crypto_aead *tfm;
 
-    if (!ssl || !ssl->tfm)
+    if (!ssl)
         return -EINVAL;
 
-    /* Initialize crypto parameters */
+    /* Initialize AEAD transform */
+    tfm = crypto_alloc_aead("gcm(aes)", 0, CRYPTO_ALG_ASYNC);
+    if (IS_ERR(tfm))
+        return PTR_ERR(tfm);
+
+    ssl->tfm = tfm;
+    ssl->key_size = crypto_aead_keysize(tfm);
+    ssl->iv_size = crypto_aead_ivsize(tfm);
+
+    /* Allocate key and IV */
+    ssl->key = kzalloc(ssl->key_size, GFP_KERNEL);
+    ssl->iv = kzalloc(ssl->iv_size, GFP_KERNEL);
+    if (!ssl->key || !ssl->iv) {
+        ret = -ENOMEM;
+        goto cleanup;
+    }
+
+    /* Generate random key material */
+    get_random_bytes(ssl->key, ssl->key_size);
+    get_random_bytes(ssl->iv, ssl->iv_size);
+
+    /* Set key */
     ret = crypto_aead_setkey(ssl->tfm, ssl->key, ssl->key_size);
     if (ret)
-        return ret;
+        goto cleanup;
 
     /* Initialize scatterlists */
+    ssl->sg_tx = kcalloc(2, sizeof(struct scatterlist), GFP_KERNEL);
+    ssl->sg_rx = kcalloc(2, sizeof(struct scatterlist), GFP_KERNEL);
+    if (!ssl->sg_tx || !ssl->sg_rx) {
+        ret = -ENOMEM;
+        goto cleanup;
+    }
+
     sg_init_table(ssl->sg_tx, 2);
     sg_init_table(ssl->sg_rx, 2);
 
+    /* Allocate request */
+    ssl->req = aead_request_alloc(ssl->tfm, GFP_KERNEL);
+    if (!ssl->req) {
+        ret = -ENOMEM;
+        goto cleanup;
+    }
+
     return 0;
+
+cleanup:
+    if (ssl->req)
+        aead_request_free(ssl->req);
+    kfree(ssl->sg_tx);
+    kfree(ssl->sg_rx);
+    kfree(ssl->key);
+    kfree(ssl->iv);
+    crypto_free_aead(ssl->tfm);
+    return ret;
 }
 
 /* Helper Functions */
@@ -650,15 +824,33 @@ cleanup_ssl:
 }
 static int establish_connection(struct llm_config *config, struct llm_connection *conn) {
     int ret;
-    struct sockaddr_in *addr = &conn->addr;
+    struct sockaddr_in *addr;
+    unsigned long timeout;
+
+    if (!config || !conn)
+        return -EINVAL;
+
+    memset(conn, 0, sizeof(*conn));
+    addr = &conn->addr;
+    timeout = msecs_to_jiffies(config->timeout_ms);
 
     /* Create socket */
     ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &conn->sock);
     if (ret < 0)
         return -LLM_ERR_NETWORK_INIT;
 
+    /* Set timeouts */
+    ret = sock_setsockopt(conn->sock, SOL_SOCKET, SO_SNDTIMEO,
+                         (char *)&timeout, sizeof(timeout));
+    if (ret < 0)
+        goto cleanup_socket;
+
+    ret = sock_setsockopt(conn->sock, SOL_SOCKET, SO_RCVTIMEO,
+                         (char *)&timeout, sizeof(timeout));
+    if (ret < 0)
+        goto cleanup_socket;
+
     /* Setup address */
-    memset(addr, 0, sizeof(*addr));
     addr->sin_family = AF_INET;
     addr->sin_port = htons(443);
     ret = in4_pton(config->endpoint, strlen(config->endpoint),
@@ -668,7 +860,7 @@ static int establish_connection(struct llm_config *config, struct llm_connection
         goto cleanup_socket;
     }
 
-    /* Connect with timeout */
+    /* Connect with SSL if enabled */
     ret = kernel_connect(conn->sock, (struct sockaddr *)addr,
                         sizeof(*addr), O_NONBLOCK);
     if (ret < 0 && ret != -EINPROGRESS) {
@@ -676,7 +868,6 @@ static int establish_connection(struct llm_config *config, struct llm_connection
         goto cleanup_socket;
     }
 
-    /* Setup SSL if enabled */
     if (config->use_ssl) {
         ret = establish_ssl_connection(conn);
         if (ret) {
@@ -688,7 +879,7 @@ static int establish_connection(struct llm_config *config, struct llm_connection
     return 0;
 
 cleanup_socket:
-    sock_release(conn->sock);
+    cleanup_connection(conn);
     return ret;
 }
 static int establish_connection_with_timeout(struct llm_config *config,
@@ -715,6 +906,23 @@ static int establish_connection_with_timeout(struct llm_config *config,
 
     return 0;
 }
+
+
+int llm_set_api_key(struct llm_config *config, const char *key) {
+    if (!config || !key)
+        return -EINVAL;
+
+    if (strlen(key) >= API_KEY_MAX_LEN)
+        return -E2BIG;
+
+    mutex_lock(&config->config_lock);
+    strncpy(config->api_key, key, API_KEY_MAX_LEN - 1);
+    config->api_key[API_KEY_MAX_LEN - 1] = '\0';
+    mutex_unlock(&config->config_lock);
+
+    return 0;
+}
+
 static int send_http_request(struct llm_connection *conn,
                            struct llm_json_buffer *buf) {
     struct msghdr msg = {0};
@@ -722,12 +930,13 @@ static int send_http_request(struct llm_connection *conn,
     char headers[512];
     int ret;
 
-    ret = snprintf(headers, sizeof(headers),
+     ret = snprintf(headers, sizeof(headers),
         "POST /v1/chat/completions HTTP/1.1\r\n"
         "Host: api.openai.com\r\n"
+        "Authorization: Bearer %s\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %zu\r\n"
-        "\r\n", buf->used);
+        "\r\n", conn->config->api_key, buf->used);
 
     if (ret >= sizeof(headers))
         return -EOVERFLOW;
@@ -1010,10 +1219,9 @@ void llm_cleanup(void)
 }
 
 /* Message Sending and Response Handling */
-int llm_send_message(struct llm_config *config, struct llm_message *msg)
-{
-    struct llm_connection conn;
-    struct llm_json_buffer req_buf;
+int llm_send_message(struct llm_config *config, struct llm_message *msg) {
+    struct llm_connection conn = {0};
+    struct llm_json_buffer req_buf = {0};
     int ret;
 
     if (!config || !msg)
@@ -1023,34 +1231,24 @@ int llm_send_message(struct llm_config *config, struct llm_message *msg)
     if (ret != 0)
         return ret;
 
-    /* Check rate limiting */
-    if (check_rate_limit(config) != 0)
-        return -LLM_ERR_RATE_LIMIT;
+    ret = check_rate_limit(config);
+    if (ret != 0)
+        return ret;
 
-    /* Format JSON request */
     ret = format_request_json(config, msg, &req_buf);
     if (ret != 0)
         return ret;
 
-    /* Establish connection */
     ret = establish_connection(config, &conn);
     if (ret != 0)
-        goto out_free_json;
+        goto cleanup_buf;
 
-    /* Send HTTP request */
     ret = send_http_request(&conn, &req_buf);
-    if (ret != 0)
-        goto out_close_conn;
 
-    /* Cleanup */
+cleanup_conn:
     cleanup_connection(&conn);
-    free_json_buffer(&req_buf);
-    return 0;
-
-    out_close_conn:
-        cleanup_connection(&conn);
-    out_free_json:
-        free_json_buffer(&req_buf);
+cleanup_buf:
+    llm_json_buffer_free(&req_buf);
     return ret;
 }
 
@@ -1102,6 +1300,9 @@ static void __exit llm_provider_exit(void)
 
 module_init(llm_provider_init);
 module_exit(llm_provider_exit);
+
+
+
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sina Mazaheri");
