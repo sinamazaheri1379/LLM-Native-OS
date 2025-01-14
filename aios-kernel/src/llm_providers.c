@@ -224,20 +224,58 @@ static int json_escape_string(const char *input, char *output, size_t outlen) {
 /* JSON Generation with validation */
 static int append_json_string(struct llm_json_buffer *buf, const char *str) {
     char *escaped;
+    size_t len, max_size;
     int ret;
 
-    escaped = kmalloc(strlen(str) * 6 + 1, GFP_KERNEL);
-    if (!escaped) return -ENOMEM;
+    if (!buf || !str)
+        return -EINVAL;
 
-    ret = json_escape_string(str, escaped, strlen(str) * 6 + 1);
+    len = strlen(str);
+    if (len == 0)
+        return append_to_json(buf, "\"\"");
+
+    /* Check if escaping is needed first */
+    bool needs_escape = false;
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] < 32 || str[i] == '"' || str[i] == '\\') {
+            needs_escape = true;
+            break;
+        }
+    }
+
+    if (!needs_escape) {
+        /* Fast path - no escaping needed */
+        ret = append_to_json(buf, "\"");
+        if (ret) return ret;
+        ret = append_to_json(buf, str);
+        if (ret) return ret;
+        return append_to_json(buf, "\"");
+    }
+
+    /* Slow path - escaping needed */
+    max_size = len * 6 + 1; /* Worst case: each char needs escaping */
+    escaped = kmalloc(max_size, GFP_KERNEL);
+    if (!escaped)
+        return -ENOMEM;
+
+    ret = json_escape_string(str, escaped, max_size);
     if (ret < 0) {
+        kfree(escaped);
+        return ret;
+    }
+
+    ret = append_to_json(buf, "\"");
+    if (ret) {
         kfree(escaped);
         return ret;
     }
 
     ret = append_to_json(buf, escaped);
     kfree(escaped);
-    return ret;
+    if (ret)
+        return ret;
+
+    return append_to_json(buf, "\"");
 }
 
 
@@ -371,7 +409,12 @@ static int format_request_json(struct llm_config *config,
 
     if (!buf || !config || !msg)
         return -EINVAL;
+    if (!LLM_VALID_MAX_TOKENS(config->max_tokens) ||
+        !LLM_VALID_TEMP_RANGE(config->temperature_X100))
+        return -EINVAL;
 
+    if (!config->model[0] || strlen(config->model) >= MAX_MODEL_NAME)
+        return -EINVAL;
     ret = llm_json_buffer_init(buf, MAX_PROMPT_LENGTH);
     if (ret)
         return ret;
@@ -421,13 +464,22 @@ static int parse_json_value(struct json_parser *parser,
     char temp[256];
     int ret = 0;
 
+    if (!parser || !key || !out)
+        return -EINVAL;
+
+    if (strlen(key) >= 256)  // Prevent overflow
+        return -E2BIG;
+
     token = get_next_token(parser);
+    if (token.type == JSON_ERROR)
+        return -EINVAL;
+
     switch (type) {
         case JSON_STRING:
             if (token.type != JSON_STRING)
                 return -EINVAL;
 
-            if (token.len >= 256)
+            if (token.len >= sizeof(temp) - 1)
                 return -E2BIG;
 
             memcpy(temp, token.value, token.len);
@@ -439,6 +491,9 @@ static int parse_json_value(struct json_parser *parser,
         case JSON_NUMBER:
             if (token.type != JSON_NUMBER)
                 return -EINVAL;
+
+            if (token.len >= sizeof(temp) - 1)
+                return -E2BIG;
 
             memcpy(temp, token.value, token.len);
             temp[token.len] = '\0';
