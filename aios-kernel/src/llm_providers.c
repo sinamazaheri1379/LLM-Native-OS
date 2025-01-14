@@ -1285,6 +1285,85 @@ cleanup_buffer:
     return ret;
 }
 
+static int __init llm_provider_init(void) {
+    /* Register character device */
+    major_number = register_chrdev(0, DEVICE_NAME, &fops);
+    if (major_number < 0) {
+        pr_err("Failed to register character device\n");
+        return major_number;
+    }
+
+    /* Create device class */
+    llm_class = class_create(THIS_MODULE, DEVICE_NAME);
+    if (IS_ERR(llm_class)) {
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return PTR_ERR(llm_class);
+    }
+
+    /* Create device */
+    llm_device = device_create(llm_class, NULL,
+                             MKDEV(major_number, 0),
+                             NULL, DEVICE_NAME);
+    if (IS_ERR(llm_device)) {
+        class_destroy(llm_class);
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return PTR_ERR(llm_device);
+    }
+
+    pr_info("LLM: Provider module loaded\n");
+    return 0;
+}
+
+static int llm_open(struct inode *inode, struct file *file) {
+    return 0;
+}
+
+static int llm_release(struct inode *inode, struct file *file) {
+    return 0;
+}
+
+static ssize_t llm_read(struct file *file, char __user *buf,
+                       size_t count, loff_t *offset) {
+    struct llm_response resp;
+    int ret;
+
+    /* Get response from OpenAI */
+    ret = llm_receive_response(global_config, &resp);
+    if (ret < 0)
+        return ret;
+
+    /* Copy to user space */
+    if (copy_to_user(buf, resp.message->content,
+                    resp.message->content_length))
+        return -EFAULT;
+
+    return resp.message->content_length;
+}
+
+static ssize_t llm_write(struct file *file, const char __user *buf,
+                        size_t count, loff_t *offset) {
+    struct llm_request req;
+    struct llm_message *msg;
+    int ret;
+
+    if (count != sizeof(struct llm_request))
+        return -EINVAL;
+
+    /* Copy from user space */
+    if (copy_from_user(&req, buf, sizeof(req)))
+        return -EFAULT;
+
+    /* Create and send message */
+    msg = llm_message_alloc(req.role, req.prompt);
+    if (!msg)
+        return -ENOMEM;
+
+    ret = llm_send_message(global_config, msg);
+    llm_message_free(msg);
+
+    return ret ? ret : count;
+}
+
 /* Module initialization and cleanup */
 static int __init llm_provider_init(void)
 {
