@@ -23,7 +23,9 @@
 #include <net/sock.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
-
+#include <linux/slab.h>
+#include <linux/tls.h>
+#include <net/tls.h>
 /* Maximum buffer sizes */
 #define MAX_API_KEY_LENGTH     256
 #define MAX_PROMPT_LENGTH      4096
@@ -38,7 +40,11 @@
 #define MAX_FUNCTION_ARGS     1024
 #define MAX_STOP_SEQ_LEN      64
 #define MAX_INT32         0x7FFFFFFF
-
+#define MAX_CONN_POOL_SIZE 8
+#define CONN_TIMEOUT_MS 30000
+#define CONN_KEEPALIVE_MS 5000
+#define LLM_MAX_ERROR_RETRIES 3
+#define LLM_ERROR_WINDOW_MS 300000  // 5 minutes
 /* Message roles */
 #define ROLE_SYSTEM     "system"
 #define ROLE_USER       "user"
@@ -113,6 +119,134 @@ typedef struct llm_ssl_context llm_ssl_context_t;
  * @major: Major version number
  * @minor: Minor version number
  */
+/* Memory tracking structure */
+/* Error logging levels */
+struct llm_rate_limiter {
+    atomic_t tokens;
+    atomic_t max_tokens;
+    atomic64_t last_refill;
+    spinlock_t limiter_lock;
+    unsigned long refill_interval_ms;
+    unsigned long tokens_per_interval;
+    atomic_t is_limited;
+};
+
+/* Rate limit states */
+enum llm_rate_state {
+    RATE_STATE_OK,
+    RATE_STATE_LIMITED,
+    RATE_STATE_RECOVERING
+};
+
+
+
+struct llm_response_handler {
+    struct llm_response *resp;
+    struct llm_json_buffer *buffer;
+    size_t max_size;
+    bool streaming;
+    void (*callback)(struct llm_response *resp, void *data);
+    void *callback_data;
+    atomic_t is_complete;
+    spinlock_t handler_lock;
+};
+
+/* Response states */
+enum response_state {
+    RESP_STATE_INIT,
+    RESP_STATE_HEADERS,
+    RESP_STATE_BODY,
+    RESP_STATE_COMPLETE,
+    RESP_STATE_ERROR
+};
+
+
+struct llm_message_queue {
+    struct list_head messages;
+    spinlock_t queue_lock;
+    wait_queue_head_t wait_queue;
+    atomic_t count;
+    size_t max_size;
+    atomic_t is_active;
+};
+
+/* Queue item structure */
+struct queue_item {
+    struct llm_message *msg;
+    struct list_head list;
+    unsigned long timestamp;
+    int priority;
+};
+
+struct llm_config_state {
+    atomic_t is_initialized;
+    atomic_t is_modified;
+    atomic_t ref_count;
+    struct mutex state_lock;
+    unsigned long last_modified;
+    char last_modifier[64];
+};
+
+
+struct llm_config_validator {
+    const char *name;
+    int (*validate)(const void *value, size_t size);
+    const char *description;
+};
+
+#define DEFINE_VALIDATOR(name, func, desc) \
+    { name, func, desc }
+
+
+enum llm_log_level {
+    LLM_LOG_DEBUG,
+    LLM_LOG_INFO,
+    LLM_LOG_WARN,
+    LLM_LOG_ERROR
+};
+
+
+enum llm_error_category {
+    LLM_ERR_CAT_NETWORK,
+    LLM_ERR_CAT_API,
+    LLM_ERR_CAT_MEMORY,
+    LLM_ERR_CAT_INTERNAL,
+    LLM_ERR_CAT_SECURITY
+};
+
+struct retry_context {
+    int max_retries;
+    int current_retry;
+    unsigned long delay_ms;
+    unsigned long max_delay_ms;
+    const char *operation;
+};
+/* Error tracking structure */
+struct llm_error_state {
+    atomic_t error_count;
+    atomic64_t first_error_time;
+    atomic64_t last_error_time;
+    spinlock_t error_lock;
+    int last_error;
+    char last_error_func[64];
+    int last_error_line;
+};
+struct llm_mem_tracker {
+    atomic_t alloc_count;
+    atomic_t free_count;
+    atomic64_t total_bytes;
+    spinlock_t track_lock;
+    struct list_head alloc_list;  // List of active allocations
+};
+
+/* Track individual allocations */
+struct llm_mem_block {
+    void *ptr;
+    size_t size;
+    const char *func;
+    int line;
+    struct list_head list;
+};
 
 
 
@@ -125,6 +259,25 @@ struct llm_version {
 /**
  * struct llm_rate_limit - Rate limiting information
  */
+struct llm_rate_limiter {
+    atomic_t tokens;
+    atomic_t max_tokens;
+    atomic64_t last_refill;
+    spinlock_t limiter_lock;
+    unsigned long refill_interval_ms;
+    unsigned long tokens_per_interval;
+    atomic_t is_limited;
+};
+
+
+/* Rate limit states */
+enum llm_rate_state {
+    RATE_STATE_OK,
+    RATE_STATE_LIMITED,
+    RATE_STATE_RECOVERING
+};
+
+
 struct llm_rate_limit {
     atomic_t requests_remaining;
     atomic_t tokens_remaining;
@@ -205,6 +358,13 @@ struct llm_tool_call {
     struct list_head list;
 };
 
+/* Connection pool */
+struct llm_conn_pool {
+    struct llm_connection *connections[MAX_CONN_POOL_SIZE];
+    atomic_t conn_refs[MAX_CONN_POOL_SIZE];
+    spinlock_t pool_lock;
+    atomic_t total_conns;
+};
 /**
  * struct llm_response - API response container
  */
