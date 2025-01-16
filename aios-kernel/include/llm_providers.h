@@ -101,7 +101,6 @@ LLM_VALID_API_KEY((x)->api_key))
  * - Lock order: config_lock -> message_lock -> tool_lock
  */
 
-struct llm_ssl_context;
 struct llm_message;
 struct llm_tool;
 struct llm_tool_call;
@@ -146,15 +145,27 @@ struct llm_message {
 /**
  * struct llm_connection - Network connection state
  */
+enum conn_state {
+    CONN_STATE_INIT,
+    CONN_STATE_CONNECTING,
+    CONN_STATE_CONNECTED,
+    CONN_STATE_ERROR,
+    CONN_STATE_CLOSED
+};
+
 struct llm_connection {
     struct socket *sock;
     struct sockaddr_in addr;
     bool ssl_enabled;
-    llm_ssl_context_t *ssl_context;
-    atomic_t in_use;
-    struct mutex lock;
+    struct tls_context *tls;  // Use kernel TLS instead of custom SSL
+    enum conn_state state;
+    atomic_t ref_count;
+    unsigned long last_used;
+    unsigned long timeout_ms;
+    spinlock_t lock;
+    struct llm_config *config;
+    bool keepalive;
 };
-
 /**
  * struct llm_json_buffer - JSON data buffer
  */
@@ -287,93 +298,22 @@ struct llm_provider_ops {
     int (*process_tool_call)(struct llm_tool_call *call);
 };
 
-/* Core validation functions */
-static inline int llm_validate_config(const struct llm_config *config) {
-    if (!config) return LLM_ERR_INVALID_PARAM;
-    if (!mutex_is_locked(&config->config_lock)) return LLM_ERR_MUTEX_LOCK;
-    if (!LLM_VALID_MAX_TOKENS(config->max_tokens)) return LLM_ERR_INVALID_PARAM;
-    if (!LLM_VALID_N_CHOICES(config->n_choices)) return LLM_ERR_INVALID_PARAM;
-    if (!LLM_VALID_TEMP_RANGE(config->temperature_X100)) return LLM_ERR_INVALID_PARAM;
-    if (!LLM_VALID_PENALTY_RANGE(config->presence_penalty_X100)) return LLM_ERR_INVALID_PARAM;
-    if (!LLM_VALID_TIMEOUT(config->timeout_ms)) return LLM_ERR_INVALID_PARAM;
-    if (!LLM_VALID_REQ_LIMIT(config->max_requests_per_min)) return LLM_ERR_INVALID_PARAM;
-    if (!LLM_VALID_ENDPOINT(config->endpoint)) return LLM_ERR_INVALID_PARAM;
-    if (!LLM_VALID_USER_ID(config->user_id)) return LLM_ERR_INVALID_PARAM;
-    if (config->num_stop_sequences > 4) return LLM_ERR_INVALID_PARAM;
-    if (atomic_read(&config->ref_count) <= 0) return LLM_ERR_REF_COUNT;
-    return LLM_ERR_SUCCESS;
-}
 
-static inline int llm_check_version(struct llm_version *version) {
-    if (!version) return -LLM_ERR_INVALID_PARAM;
-    if (version->major != LLM_API_VERSION_MAJOR) return -LLM_ERR_INVALID_PARAM;
-    if (version->minor > LLM_API_VERSION_MINOR) return -LLM_ERR_INVALID_PARAM;
-    return LLM_ERR_SUCCESS;
-}
 
-/* Reference counting */
-static inline void llm_config_get(struct llm_config *config) {
-    smp_mb__before_atomic();
-    atomic_inc(&config->ref_count);
-    smp_mb__after_atomic();
-}
+
+
+
 
 /* Corrected cleanup function */
-static inline void llm_config_cleanup(struct llm_config *config) {
-    struct llm_message *msg, *tmp_msg;
-    struct llm_tool *tool, *tmp_tool;
 
-    if (!config || !mutex_is_locked(&config->config_lock))
-        return;
-
-    /* Clean message history */
-    list_for_each_entry_safe(msg, tmp_msg, &config->message_history, list) {
-        list_del(&msg->list);
-        llm_message_free(msg);
-    }
-
-    /* Clean tools */
-    list_for_each_entry_safe(tool, tmp_tool, &config->tools, list) {
-        list_del(&tool->list);
-        llm_tool_free(tool);
-    }
-
-    mutex_destroy(&config->message_lock);
-    mutex_destroy(&config->tool_lock);
-    /* config_lock destroyed last */
-    mutex_destroy(&config->config_lock);
-}
 
 int llm_set_api_key(struct llm_config *config, const char *api_key);
 int llm_load_api_key_from_env(struct llm_config *config);
 /* Complete the config_put implementation */
-static inline void llm_config_put(struct llm_config *config) {
-    if (!config)
-        return;
 
-    smp_mb__before_atomic();
-    if (atomic_dec_and_test(&config->ref_count)) {
-        smp_mb__after_atomic();
-        mutex_lock(&config->config_lock);
-        llm_config_cleanup(config);
-        kfree(config);
-    }
-}
 
 /* Add JSON buffer management declarations */
-static inline int llm_json_buffer_init(struct llm_json_buffer *buf, size_t size) {
-    if (!buf || size == 0)
-        return -LLM_ERR_INVALID_PARAM;
 
-    buf->data = kmalloc(size, GFP_KERNEL);
-    if (!buf->data)
-        return -LLM_ERR_NOMEM;
-
-    buf->size = size;
-    buf->used = 0;
-    buf->data[0] = '\0';
-    return 0;
-}
 void llm_json_buffer_free(struct llm_json_buffer *buf);
 int llm_json_buffer_append(struct llm_json_buffer *buf, const char *str);
 
