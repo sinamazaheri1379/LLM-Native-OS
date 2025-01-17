@@ -826,6 +826,224 @@ static int parse_json_response(const char *buffer, size_t len, struct llm_respon
     return 0;
 }
 //////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+/* Improved memory allocator with tracking */
+static struct kmem_cache *llm_msg_cache;
+static struct kmem_cache *llm_conn_cache;
+
+static int __init llm_cache_init(void) {
+    llm_msg_cache = kmem_cache_create("llm_message",
+                                     sizeof(struct llm_message),
+                                     0, SLAB_HWCACHE_ALIGN | SLAB_PANIC,
+                                     NULL);
+
+    llm_conn_cache = kmem_cache_create("llm_connection",
+                                      sizeof(struct llm_connection),
+                                      0, SLAB_HWCACHE_ALIGN | SLAB_PANIC,
+                                      NULL);
+    return 0;
+}
+
+static void llm_cache_exit(void) {
+    kmem_cache_destroy(llm_msg_cache);
+    kmem_cache_destroy(llm_conn_cache);
+}
+
+/* Secure allocation with poisoning */
+static inline void *llm_malloc(size_t size, gfp_t flags) {
+    void *ptr = kmalloc(size, flags);
+    if (ptr && !(flags & __GFP_ZERO))
+        memset(ptr, 0xAA, size);
+    return ptr;
+}
+
+/* Safe message allocation */
+struct llm_message *llm_message_alloc(const char *role, const char *content) {
+    struct llm_message *msg;
+    size_t content_len;
+
+    if (!role || !content)
+        return NULL;
+
+    msg = kmem_cache_alloc(llm_msg_cache, GFP_KERNEL);
+    if (!msg)
+        return NULL;
+
+    content_len = strlen(content) + 1;
+    if (content_len > MAX_PROMPT_LENGTH) {
+        kmem_cache_free(llm_msg_cache, msg);
+        return NULL;
+    }
+
+    msg->content = llm_malloc(content_len, GFP_KERNEL);
+    if (!msg->content) {
+        kmem_cache_free(llm_msg_cache, msg);
+        return NULL;
+    }
+
+    strscpy(msg->role, role, MAX_ROLE_LENGTH);
+    strscpy(msg->content, content, content_len);
+    msg->content_length = content_len - 1;
+    INIT_LIST_HEAD(&msg->list);
+
+    return msg;
+}
+
+struct llm_conn_pool {
+    struct {
+        struct llm_connection *conn;
+        atomic_t ref_count;
+        unsigned long last_used;
+        spinlock_t lock;
+    } slots[MAX_CONN_POOL_SIZE];
+    atomic_t total_conns;
+    struct work_struct cleanup_work;
+    struct timer_list cleanup_timer;
+};
+
+static void connection_cleanup_worker(struct work_struct *work) {
+    struct llm_conn_pool *pool = container_of(work, struct llm_conn_pool,
+                                            cleanup_work);
+    int i;
+    unsigned long flags;
+    unsigned long now = jiffies;
+
+    for (i = 0; i < MAX_CONN_POOL_SIZE; i++) {
+        spin_lock_irqsave(&pool->slots[i].lock, flags);
+        if (pool->slots[i].conn &&
+            atomic_read(&pool->slots[i].ref_count) == 0 &&
+            time_after(now, pool->slots[i].last_used +
+                           msecs_to_jiffies(CONN_KEEPALIVE_MS))) {
+            struct llm_connection *conn = pool->slots[i].conn;
+            pool->slots[i].conn = NULL;
+            spin_unlock_irqrestore(&pool->slots[i].lock, flags);
+
+            cleanup_connection(conn);
+            atomic_dec(&pool->total_conns);
+        } else {
+            spin_unlock_irqrestore(&pool->slots[i].lock, flags);
+        }
+    }
+}
+
+static struct llm_connection *get_connection_safe(struct llm_config *config) {
+    struct llm_connection *conn = NULL;
+    int i, found = -1;
+    unsigned long flags;
+
+    /* Try to find existing connection */
+    for (i = 0; i < MAX_CONN_POOL_SIZE; i++) {
+        spin_lock_irqsave(&conn_pool->slots[i].lock, flags);
+        if (conn_pool->slots[i].conn &&
+            atomic_read(&conn_pool->slots[i].ref_count) == 0) {
+            atomic_inc(&conn_pool->slots[i].ref_count);
+            conn = conn_pool->slots[i].conn;
+            conn_pool->slots[i].last_used = jiffies;
+            spin_unlock_irqrestore(&conn_pool->slots[i].lock, flags);
+            return conn;
+        }
+        spin_unlock_irqrestore(&conn_pool->slots[i].lock, flags);
+    }
+
+    /* Create new connection if needed */
+    conn = establish_connection_safe(config);
+    if (!IS_ERR(conn)) {
+        for (i = 0; i < MAX_CONN_POOL_SIZE; i++) {
+            spin_lock_irqsave(&conn_pool->slots[i].lock, flags);
+            if (!conn_pool->slots[i].conn) {
+                conn_pool->slots[i].conn = conn;
+                atomic_set(&conn_pool->slots[i].ref_count, 1);
+                conn_pool->slots[i].last_used = jiffies;
+                atomic_inc(&conn_pool->total_conns);
+                spin_unlock_irqrestore(&conn_pool->slots[i].lock, flags);
+                return conn;
+            }
+            spin_unlock_irqrestore(&conn_pool->slots[i].lock, flags);
+        }
+        /* No free slots */
+        cleanup_connection(conn);
+        return ERR_PTR(-EAGAIN);
+    }
+    return conn;
+}
+
+struct llm_error_info {
+    int code;
+    const char *msg;
+    enum error_severity severity;
+    unsigned long timestamp;
+    int retry_count;
+    bool recoverable;
+};
+
+static void handle_error_with_context(struct llm_error_info *err_info,
+                                    struct llm_config *config) {
+    static DEFINE_SPINLOCK(error_lock);
+    unsigned long flags;
+
+    spin_lock_irqsave(&error_lock, flags);
+
+    /* Log error with context */
+    llm_log_error(err_info->severity, __func__, __LINE__,
+                  err_info->code, "%s", err_info->msg);
+
+    /* Update error statistics */
+    atomic_inc(&error_state.error_count);
+    atomic64_set(&error_state.last_error_time, ktime_get_ms());
+
+    /* Check circuit breaker */
+    if (should_trigger_circuit_breaker()) {
+        config->state.circuit_breaker_triggered = true;
+        wake_up_all(&config->state.wait_queue);
+    }
+
+    spin_unlock_irqrestore(&error_lock, flags);
+
+    /* Handle recoverable errors */
+    if (err_info->recoverable && err_info->retry_count < LLM_MAX_ERROR_RETRIES) {
+        schedule_delayed_work(&config->error_recovery_work,
+                            msecs_to_jiffies(1000 * (1 << err_info->retry_count)));
+    }
+}
+
+static int establish_tls_connection_safe(struct llm_config *config,
+                                       struct llm_connection *conn) {
+    struct tls_context *tls;
+    int ret;
+
+    tls = kzalloc(sizeof(*tls), GFP_KERNEL);
+    if (!tls)
+        return -ENOMEM;
+
+    /* Initialize crypto */
+    tls->tfm = crypto_alloc_aead("gcm(aes)", 0, CRYPTO_ALG_ASYNC);
+    if (IS_ERR(tls->tfm)) {
+        ret = PTR_ERR(tls->tfm);
+        goto cleanup_tls;
+    }
+
+    /* Setup crypto parameters */
+    ret = crypto_aead_setkey(tls->tfm, config->tls_key,
+                            crypto_aead_keysize(tls->tfm));
+    if (ret)
+        goto cleanup_crypto;
+
+    /* Initialize TLS handshake */
+    ret = tls_init_handshake(tls, conn);
+    if (ret)
+        goto cleanup_crypto;
+
+    conn->tls = tls;
+    return 0;
+
+cleanup_crypto:
+    crypto_free_aead(tls->tfm);
+cleanup_tls:
+    kfree(tls);
+    return ret;
+}
+
 /* Initialize message queue */
 static int init_message_queue(struct llm_message_queue *queue, size_t max_size) {
     if (!queue)
