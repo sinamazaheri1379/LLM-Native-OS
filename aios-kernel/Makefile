@@ -1,7 +1,4 @@
-# Check for OpenAI API Key
-ifeq ($(strip $(OPENAI_API_KEY)),)
-$(error OPENAI_API_KEY environment variable is not set)
-endif
+# Revised Makefile for LLM kernel modules
 
 # Modules to build
 obj-m += llm-native.o
@@ -22,8 +19,8 @@ llm-native-objs := \
 test-objs := test/src/test.o
 
 # Include directories
-ccflags-y := -I$(src)/include
-ccflags-y += -I$(src)/test/include
+ccflags-y := -I$(PWD)/include
+ccflags-y += -I$(PWD)/test/include
 
 # Get kernel build path
 KDIR ?= /lib/modules/$(shell uname -r)/build
@@ -32,13 +29,16 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 ccflags-y += -Wall -Werror -g
 ccflags-y += -DDEBUG
 
-# Module parameters
+# Module parameters (API key to be passed during load)
+# Note: The OPENAI_API_KEY is now checked during module loading.
 MODULE_PARAMS := api_key=$(OPENAI_API_KEY)
 
 all:
-	make -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 load: all
+	@# Check for OPENAI_API_KEY before loading modules
+	@test -n "$(OPENAI_API_KEY)" || { echo "OPENAI_API_KEY environment variable is not set"; exit 1; }
 	sudo insmod llm-native.ko $(MODULE_PARAMS)
 	sudo insmod test.ko
 
@@ -47,10 +47,10 @@ unload:
 	sudo rmmod llm-native
 
 clean:
-	make -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
 install:
-	make -C $(KDIR) M=$(PWD) modules_install
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 	depmod -a
 
 debug: ccflags-y += -DDEBUG_EXTRA

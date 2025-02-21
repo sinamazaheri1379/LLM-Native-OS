@@ -45,12 +45,18 @@
 #define CONN_KEEPALIVE_MS 5000
 #define LLM_MAX_ERROR_RETRIES 3
 #define LLM_ERROR_WINDOW_MS 300000  // 5 minutes
+
 /* Message roles */
 #define ROLE_SYSTEM     "system"
 #define ROLE_USER       "user"
 #define ROLE_ASSISTANT  "assistant"
 #define ROLE_TOOL       "tool"
-
+/* Environment Setup */
+#define OPENAI_API_KEY_ENV "OPENAI_API_KEY"
+#define DEFINE_VALIDATOR(name, func, desc) \
+    { name, func, desc }
+#define LLM_API_VERSION_MAJOR  1
+#define LLM_API_VERSION_MINOR  0
 /* Error Codes */
 #define LLM_ERR_SUCCESS         0
 #define LLM_ERR_INVALID_PARAM  -1
@@ -96,9 +102,7 @@ LLM_VALID_API_KEY((x)->api_key))
 #define LLM_VALID_JSON_APPEND(x,s) ((x) != NULL && (s) != NULL && \
 ((x)->used + strlen(s) + 1 <= (x)->size))
 /* Version information */
-#define LLM_API_VERSION_MAJOR  1
-#define LLM_API_VERSION_MINOR  0
-#define OPENAI_API_KEY_ENV "OPENAI_API_KEY"
+
 /**
  * Locking rules:
  * - config_lock protects configuration parameters
@@ -107,7 +111,84 @@ LLM_VALID_API_KEY((x)->api_key))
  * - Lock order: config_lock -> message_lock -> tool_lock
  */
 
-struct llm_message;
+
+/////////*  Enum Definitions  */////////
+
+/* Rate limit states */
+enum llm_rate_state {
+    RATE_STATE_OK,
+    RATE_STATE_LIMITED,
+    RATE_STATE_RECOVERING
+};
+
+/* Response states */
+enum response_state {
+    RESP_STATE_INIT,
+    RESP_STATE_HEADERS,
+    RESP_STATE_BODY,
+    RESP_STATE_COMPLETE,
+    RESP_STATE_ERROR
+};
+
+/* Log Events */
+enum llm_log_level {
+    LLM_LOG_DEBUG,
+    LLM_LOG_INFO,
+    LLM_LOG_WARN,
+    LLM_LOG_ERROR
+};
+
+/* Error State Recovery */
+enum llm_error_category {
+    LLM_ERR_CAT_NETWORK,
+    LLM_ERR_CAT_API,
+    LLM_ERR_CAT_MEMORY,
+    LLM_ERR_CAT_INTERNAL,
+    LLM_ERR_CAT_SECURITY
+};
+
+/* Connection State */
+enum conn_state {
+    CONN_STATE_INIT,
+    CONN_STATE_CONNECTING,
+    CONN_STATE_CONNECTED,
+    CONN_STATE_ERROR,
+    CONN_STATE_CLOSED
+};
+
+
+/////////////////// End //////////////////////
+
+/////// Tool Related Structures //////
+struct llm_tool_param {
+    char name[MAX_TOOL_NAME];
+    char description[MAX_TOOL_DESC];
+    bool required;
+    struct list_head list;
+};
+
+/**
+ * struct llm_tool_call - Function call result
+ */
+struct llm_tool_call {
+    char id[64];
+    char name[MAX_TOOL_NAME];
+    char arguments[MAX_FUNCTION_ARGS];
+    struct list_head list;
+};
+
+/**
+ * struct llm_tool - Function calling definition
+ */
+struct llm_tool {
+    char name[MAX_TOOL_NAME];
+    char description[MAX_TOOL_DESC];
+    struct list_head parameters;
+    struct list_head list;
+};
+/////////////////// End //////////////////////
+
+
 struct llm_tool;
 struct llm_tool_call;
 struct llm_connection;
@@ -131,12 +212,7 @@ struct llm_rate_limiter {
     atomic_t is_limited;
 };
 
-/* Rate limit states */
-enum llm_rate_state {
-    RATE_STATE_OK,
-    RATE_STATE_LIMITED,
-    RATE_STATE_RECOVERING
-};
+
 
 
 
@@ -151,14 +227,7 @@ struct llm_response_handler {
     spinlock_t handler_lock;
 };
 
-/* Response states */
-enum response_state {
-    RESP_STATE_INIT,
-    RESP_STATE_HEADERS,
-    RESP_STATE_BODY,
-    RESP_STATE_COMPLETE,
-    RESP_STATE_ERROR
-};
+
 
 
 struct llm_message_queue {
@@ -194,25 +263,9 @@ struct llm_config_validator {
     const char *description;
 };
 
-#define DEFINE_VALIDATOR(name, func, desc) \
-    { name, func, desc }
 
 
-enum llm_log_level {
-    LLM_LOG_DEBUG,
-    LLM_LOG_INFO,
-    LLM_LOG_WARN,
-    LLM_LOG_ERROR
-};
 
-
-enum llm_error_category {
-    LLM_ERR_CAT_NETWORK,
-    LLM_ERR_CAT_API,
-    LLM_ERR_CAT_MEMORY,
-    LLM_ERR_CAT_INTERNAL,
-    LLM_ERR_CAT_SECURITY
-};
 
 struct retry_context {
     int max_retries;
@@ -256,28 +309,6 @@ struct llm_version {
     uint16_t minor;
 };
 
-/**
- * struct llm_rate_limit - Rate limiting information
- */
-struct llm_rate_limiter {
-    atomic_t tokens;
-    atomic_t max_tokens;
-    atomic64_t last_refill;
-    spinlock_t limiter_lock;
-    unsigned long refill_interval_ms;
-    unsigned long tokens_per_interval;
-    atomic_t is_limited;
-};
-
-
-/* Rate limit states */
-enum llm_rate_state {
-    RATE_STATE_OK,
-    RATE_STATE_LIMITED,
-    RATE_STATE_RECOVERING
-};
-
-
 struct llm_rate_limit {
     atomic_t requests_remaining;
     atomic_t tokens_remaining;
@@ -298,13 +329,7 @@ struct llm_message {
 /**
  * struct llm_connection - Network connection state
  */
-enum conn_state {
-    CONN_STATE_INIT,
-    CONN_STATE_CONNECTING,
-    CONN_STATE_CONNECTED,
-    CONN_STATE_ERROR,
-    CONN_STATE_CLOSED
-};
+
 
 struct llm_connection {
     struct socket *sock;
@@ -331,32 +356,7 @@ struct llm_json_buffer {
 /**
  * struct llm_tool_param - Function parameter definition
  */
-struct llm_tool_param {
-    char name[MAX_TOOL_NAME];
-    char description[MAX_TOOL_DESC];
-    bool required;
-    struct list_head list;
-};
 
-/**
- * struct llm_tool - Function calling definition
- */
-struct llm_tool {
-    char name[MAX_TOOL_NAME];
-    char description[MAX_TOOL_DESC];
-    struct list_head parameters;
-    struct list_head list;
-};
-
-/**
- * struct llm_tool_call - Function call result
- */
-struct llm_tool_call {
-    char id[64];
-    char name[MAX_TOOL_NAME];
-    char arguments[MAX_FUNCTION_ARGS];
-    struct list_head list;
-};
 
 /* Connection pool */
 struct llm_conn_pool {
