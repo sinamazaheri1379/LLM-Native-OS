@@ -7,15 +7,10 @@
 #ifndef LLM_PROVIDERS_H
 #define LLM_PROVIDERS_H
 
-#ifndef _LINUX_TYPES_H
+
 #include <linux/types.h>
-#endif
-#ifndef _LINUX_ATOMIC_H
 #include <linux/atomic.h>
-#endif
-#ifndef _LINUX_MUTEX_H
 #include <linux/mutex.h>
-#endif
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/net.h>
@@ -26,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/tls.h>
 #include <net/tls.h>
+#include <linux/wait.h>
 /* Maximum buffer sizes */
 #define MAX_API_KEY_LENGTH     256
 #define MAX_PROMPT_LENGTH      4096
@@ -91,7 +87,7 @@
                                    (msg)->content_length > 0 && \
                                    (msg)->content_length <= MAX_PROMPT_LENGTH)
 #define LLM_VALID_JSON_BUFFER(x)   ((x) != NULL && (x)->data != NULL && (x)->size > 0)
-#define LLM_VALID_SSL_CTX(x)       ((x) != NULL && (x)->ssl_context != NULL)
+#define LLM_VALID_SSL_CTX(x) ((x) != NULL && (x)->tls != NULL)
 #define LLM_VALID_RATE_LIMIT(x)    ((x) != NULL && atomic_read(&(x)->requests_remaining) >= 0)
 #define LLM_VALID_RESPONSE(x)      ((x) != NULL && (x)->id[0] != '\0' && (x)->status_code >= 0)
 #define LLM_VALID_TOOL(x)         ((x) != NULL && (x)->name[0] != '\0')
@@ -360,11 +356,17 @@ struct llm_json_buffer {
 
 /* Connection pool */
 struct llm_conn_pool {
-    struct llm_connection *connections[MAX_CONN_POOL_SIZE];
-    atomic_t conn_refs[MAX_CONN_POOL_SIZE];
-    spinlock_t pool_lock;
+    struct {
+        struct llm_connection *conn;
+        atomic_t ref_count;
+        unsigned long last_used;
+        spinlock_t lock;
+    } slots[MAX_CONN_POOL_SIZE];
     atomic_t total_conns;
+    struct work_struct cleanup_work;
+    struct timer_list cleanup_timer;
 };
+
 /**
  * struct llm_response - API response container
  */
@@ -387,7 +389,7 @@ struct llm_response {
 /**
  * struct llm_config - Enhanced configuration for OpenAI
  */
-struct ssl_context {
+struct llm_ssl_context {
     struct crypto_aead *tfm;
     u8 *key;
     u8 *iv;

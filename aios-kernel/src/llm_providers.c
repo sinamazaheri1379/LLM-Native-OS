@@ -7,15 +7,78 @@
 #include <linux/list.h>
 #include <linux/jiffies.h>
 #include <linux/device.h>
+#include <linux/wait.h>
 #include <linux/fs.h>
 #include "llm_providers.h"
 
+#define DEVICE_NAME "llm"
+#define llm_kmalloc(size) llm_malloc(size, __func__, __LINE__)
+#define llm_kfree(ptr) llm_free(ptr)
+static char *openai_api_key = NULL;
+module_param(openai_api_key, charp, 0600);
+MODULE_PARM_DESC(openai_api_key, "OpenAI API Key");
+
+static char *anthropic_api_key = NULL;
+module_param(anthropic_api_key, charp, 0600);
+MODULE_PARM_DESC(anthropic_api_key, "Anthropic API Key");
+/* Global state */
+static struct llm_config *global_config = NULL;
+static DEFINE_MUTEX(llm_mutex);
 static int major_number;
 static struct class *llm_class;
 static struct device *llm_device;
 static struct llm_conn_pool *conn_pool = NULL;
 static struct llm_mem_tracker mem_tracker;
 
+
+/* --- External Dependency Stubs --- */
+static int validate_api_key(const void *value, size_t size) { return 0; }
+static int validate_model(const void *value, size_t size) { return 0; }
+static int validate_endpoint(const void *value, size_t size) { return 0; }
+static int update_config_value(struct llm_config *config, const char *key, const void *value, size_t size) { return 0; }
+static int serialize_config(struct llm_config *config, char *buffer, size_t size) { return 0; }
+static int deserialize_config(struct llm_config *config, const char *buffer, size_t size) { return 0; }
+static int set_socket_options(struct socket *sock, unsigned long timeout_ms) { return 0; }
+static int connect_to_server(struct socket *sock, const char *endpoint) { return 0; }
+static int setup_tls(struct socket *sock) { return 0; }
+static void llm_log_info(const char *fmt, ...) { /* stub */ }
+static int reestablish_connection(struct llm_config *config) { return 0; }
+static void trigger_memory_cleanup(void) { }
+static int reset_tls_connection(struct llm_config *config) { return 0; }
+
+/* Forward declarations for cleanup functions */
+static void cleanup_message_history(struct llm_config *config);
+static void cleanup_tools(struct llm_config *config);
+static void cleanup_connection(struct llm_connection *conn);
+
+/* Device operations */
+static int llm_open(struct inode *inode, struct file *file);
+static int llm_release(struct inode *inode, struct file *file);
+static ssize_t llm_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
+static ssize_t llm_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
+
+//Struct Definitions//
+enum json_token_type {
+    JSON_STRING,
+    JSON_NUMBER,
+    JSON_OBJECT_START,
+    JSON_OBJECT_END,
+    JSON_ARRAY_START,
+    JSON_ARRAY_END,
+    JSON_TRUE,
+    JSON_FALSE,
+    JSON_NULL,
+    JSON_COLON,
+    JSON_COMMA,
+    JSON_ERROR
+};
+
+static struct file_operations fops = {
+    .open = llm_open,
+    .read = llm_read,
+    .write = llm_write,
+    .release = llm_release
+};
 
 static const struct llm_config_validator config_validators[] = {
     DEFINE_VALIDATOR("api_key", validate_api_key, "API key validation"),
@@ -31,6 +94,21 @@ static inline struct llm_config *get_global_config(void) {
     mutex_unlock(&llm_mutex);
     return config;
 }
+
+
+struct json_token {
+    enum json_token_type type;
+    char *value;
+    size_t len;
+};
+
+struct json_parser {
+    const char *input;
+    size_t pos;
+    size_t len;
+};
+
+///////////////////////
 
 static inline int llm_check_version(struct llm_version *version) {
     if (!version) return -LLM_ERR_INVALID_PARAM;
@@ -114,59 +192,17 @@ static inline void llm_config_put(struct llm_config *config) {
     }
 }
 
-#define DEVICE_NAME "llm"
-
-/* Device operations */
-static int llm_open(struct inode *inode, struct file *file);
-static int llm_release(struct inode *inode, struct file *file);
-static ssize_t llm_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
-static ssize_t llm_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
-
-static struct file_operations fops = {
-    .open = llm_open,
-    .read = llm_read,
-    .write = llm_write,
-    .release = llm_release
-};
 
 
 
-static char *api_key = NULL;
-module_param(api_key, charp, 0600);
-MODULE_PARM_DESC(api_key, "OpenAI API Key");
 
-/* Global state */
-static struct llm_config *global_config = NULL;
-static DEFINE_MUTEX(llm_mutex);
+
+
+
+
 
 /* JSON PARSING FUNCTIONS */
 /* JSON Token Types */
-enum json_token_type {
-    JSON_STRING,
-    JSON_NUMBER,
-    JSON_OBJECT_START,
-    JSON_OBJECT_END,
-    JSON_ARRAY_START,
-    JSON_ARRAY_END,
-    JSON_TRUE,
-    JSON_FALSE,
-    JSON_NULL,
-    JSON_COLON,
-    JSON_COMMA,
-    JSON_ERROR
-};
-
-struct json_token {
-    enum json_token_type type;
-    char *value;
-    size_t len;
-};
-
-struct json_parser {
-    const char *input;
-    size_t pos;
-    size_t len;
-};
 
 static void init_json_parser(struct json_parser *parser,
                            const char *input, size_t len) {
@@ -682,6 +718,48 @@ cleanup:
     llm_json_buffer_free(buf);
     return ret;
 }
+
+
+static int format_anthropic_request_json(struct llm_config *config,
+                                         struct llm_message *msg,
+                                         struct llm_json_buffer *buf)
+{
+    int ret;
+
+    if (!buf || !config || !msg)
+        return -EINVAL;
+
+    /* Initialize buffer with an estimated size */
+    ret = llm_json_buffer_init(buf, MAX_PROMPT_LENGTH);
+    if (ret)
+        return ret;
+
+    /* Start building JSON for Anthropic */
+    ret = append_to_json(buf, "{\"model\":\"");
+    if (ret)
+        return ret;
+    ret = append_to_json(buf, config->model);  // e.g., "claude-v1"
+    if (ret)
+        return ret;
+    ret = append_to_json(buf, "\",\"prompt\":\"");
+
+    /* For Anthropic, we typically need to build a single prompt.
+     * Here we simply prepend the role (e.g., "Human") followed by the content.
+     * You may wish to include prior conversation context if desired.
+     */
+    ret = append_to_json(buf, msg->role);
+    if (ret)
+        return ret;
+    ret = append_to_json(buf, ": ");
+    if (ret)
+        return ret;
+    ret = append_json_string(buf, msg->content);
+    if (ret)
+        return ret;
+    ret = append_to_json(buf, "\"}");
+    return ret;
+}
+
 /* Improved Response Parser */
 static int parse_json_value(struct json_parser *parser,
                           const char *key,
@@ -829,78 +907,8 @@ static int parse_json_response(const char *buffer, size_t len, struct llm_respon
 //////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////
 /* Improved memory allocator with tracking */
-static struct kmem_cache *llm_msg_cache;
-static struct kmem_cache *llm_conn_cache;
 
-static int __init llm_cache_init(void) {
-    llm_msg_cache = kmem_cache_create("llm_message",
-                                     sizeof(struct llm_message),
-                                     0, SLAB_HWCACHE_ALIGN | SLAB_PANIC,
-                                     NULL);
 
-    llm_conn_cache = kmem_cache_create("llm_connection",
-                                      sizeof(struct llm_connection),
-                                      0, SLAB_HWCACHE_ALIGN | SLAB_PANIC,
-                                      NULL);
-    return 0;
-}
-
-static void llm_cache_exit(void) {
-    kmem_cache_destroy(llm_msg_cache);
-    kmem_cache_destroy(llm_conn_cache);
-}
-
-/* Secure allocation with poisoning */
-static inline void *llm_malloc(size_t size, gfp_t flags) {
-    void *ptr = kmalloc(size, flags);
-    if (ptr && !(flags & __GFP_ZERO))
-        memset(ptr, 0xAA, size);
-    return ptr;
-}
-
-/* Safe message allocation */
-struct llm_message *llm_message_alloc(const char *role, const char *content) {
-    struct llm_message *msg;
-    size_t content_len;
-
-    if (!role || !content)
-        return NULL;
-
-    msg = kmem_cache_alloc(llm_msg_cache, GFP_KERNEL);
-    if (!msg)
-        return NULL;
-
-    content_len = strlen(content) + 1;
-    if (content_len > MAX_PROMPT_LENGTH) {
-        kmem_cache_free(llm_msg_cache, msg);
-        return NULL;
-    }
-
-    msg->content = llm_malloc(content_len, GFP_KERNEL);
-    if (!msg->content) {
-        kmem_cache_free(llm_msg_cache, msg);
-        return NULL;
-    }
-
-    strscpy(msg->role, role, MAX_ROLE_LENGTH);
-    strscpy(msg->content, content, content_len);
-    msg->content_length = content_len - 1;
-    INIT_LIST_HEAD(&msg->list);
-
-    return msg;
-}
-
-struct llm_conn_pool {
-    struct {
-        struct llm_connection *conn;
-        atomic_t ref_count;
-        unsigned long last_used;
-        spinlock_t lock;
-    } slots[MAX_CONN_POOL_SIZE];
-    atomic_t total_conns;
-    struct work_struct cleanup_work;
-    struct timer_list cleanup_timer;
-};
 
 static void connection_cleanup_worker(struct work_struct *work) {
     struct llm_conn_pool *pool = container_of(work, struct llm_conn_pool,
@@ -1650,78 +1658,80 @@ static int handle_error_with_recovery(int error, void *context) {
 }
 
 
-/* Initialize connection pool */
+/* --- Revised Connection Pool Initialization --- */
 static int init_connection_pool(void) {
     int i;
-
     conn_pool = llm_kmalloc(sizeof(*conn_pool));
     if (!conn_pool)
         return -ENOMEM;
-
-    spin_lock_init(&conn_pool->pool_lock);
     atomic_set(&conn_pool->total_conns, 0);
-
     for (i = 0; i < MAX_CONN_POOL_SIZE; i++) {
-        atomic_set(&conn_pool->conn_refs[i], 0);
-        conn_pool->connections[i] = NULL;
+        conn_pool->slots[i].conn = NULL;
+        atomic_set(&conn_pool->slots[i].ref_count, 0);
+        conn_pool->slots[i].last_used = 0;
+        spin_lock_init(&conn_pool->slots[i].lock);
     }
-
     return 0;
 }
 
-/* Get connection from pool */
+/* --- Revised get_connection Function --- */
 static struct llm_connection *get_connection(struct llm_config *config) {
     struct llm_connection *conn = NULL;
     unsigned long flags;
-    int i, found = -1;
+    int i, slot_index = -1;
 
     spin_lock_irqsave(&conn_pool->pool_lock, flags);
-
-    /* Try to find existing connection */
+    /* Look for an idle connection */
     for (i = 0; i < MAX_CONN_POOL_SIZE; i++) {
-        if (conn_pool->connections[i] &&
-            atomic_read(&conn_pool->conn_refs[i]) == 0) {
-            found = i;
+        spin_lock(&conn_pool->slots[i].lock);
+        if (conn_pool->slots[i].conn && atomic_read(&conn_pool->slots[i].ref_count) == 0) {
+            slot_index = i;
+            atomic_inc(&conn_pool->slots[i].ref_count);
+            conn = conn_pool->slots[i].conn;
+            conn_pool->slots[i].last_used = jiffies;
+            spin_unlock(&conn_pool->slots[i].lock);
             break;
         }
+        spin_unlock(&conn_pool->slots[i].lock);
     }
-
-    /* If no existing connection, try to create new one */
-    if (found == -1) {
+    /* If not found, find an empty slot */
+    if (slot_index == -1) {
         for (i = 0; i < MAX_CONN_POOL_SIZE; i++) {
-            if (!conn_pool->connections[i]) {
-                found = i;
+            spin_lock(&conn_pool->slots[i].lock);
+            if (!conn_pool->slots[i].conn) {
+                slot_index = i;
+                atomic_inc(&conn_pool->slots[i].ref_count);
+                spin_unlock(&conn_pool->slots[i].lock);
                 break;
             }
+            spin_unlock(&conn_pool->slots[i].lock);
         }
     }
-
-    if (found >= 0) {
-        atomic_inc(&conn_pool->conn_refs[found]);
-        conn = conn_pool->connections[found];
-    }
-
     spin_unlock_irqrestore(&conn_pool->pool_lock, flags);
 
-    /* Create new connection if needed */
-    if (found >= 0 && !conn) {
-        conn = llm_kmalloc(sizeof(*conn));
-        if (!conn)
-            return ERR_PTR(-ENOMEM);
-
-        ret = establish_tls_connection(config, conn);
-        if (ret < 0) {
-            llm_kfree(conn);
-            atomic_dec(&conn_pool->conn_refs[found]);
-            return ERR_PTR(ret);
+    if (slot_index >= 0) {
+        spin_lock(&conn_pool->slots[slot_index].lock);
+        if (!conn_pool->slots[slot_index].conn) {
+            conn = llm_kmalloc(sizeof(*conn));
+            if (!conn) {
+                atomic_dec(&conn_pool->slots[slot_index].ref_count);
+                spin_unlock(&conn_pool->slots[slot_index].lock);
+                return ERR_PTR(-ENOMEM);
+            }
+            int ret = establish_tls_connection(config, conn);
+            if (ret < 0) {
+                llm_kfree(conn);
+                atomic_dec(&conn_pool->slots[slot_index].ref_count);
+                spin_unlock(&conn_pool->slots[slot_index].lock);
+                return ERR_PTR(ret);
+            }
+            conn_pool->slots[slot_index].conn = conn;
+            atomic_inc(&conn_pool->total_conns);
+        } else {
+            conn = conn_pool->slots[slot_index].conn;
         }
-
-        spin_lock_irqsave(&conn_pool->pool_lock, flags);
-        conn_pool->connections[found] = conn;
-        atomic_inc(&conn_pool->total_conns);
-        spin_unlock_irqrestore(&conn_pool->pool_lock, flags);
+        spin_unlock(&conn_pool->slots[slot_index].lock);
     }
-
     return conn ? conn : ERR_PTR(-EBUSY);
 }
 
@@ -1784,107 +1794,9 @@ cleanup_sock:
 
 /* SSL Session Implementation */
 
-/* Initialize memory tracker */
-static inline void llm_mem_init(void) {
-    atomic_set(&mem_tracker.alloc_count, 0);
-    atomic_set(&mem_tracker.free_count, 0);
-    atomic64_set(&mem_tracker.total_bytes, 0);
-    spin_lock_init(&mem_tracker.track_lock);
-    INIT_LIST_HEAD(&mem_tracker.alloc_list);
-}
 
-/* Secure allocation with tracking */
-static inline void *llm_malloc(size_t size, const char *func, int line) {
-    void *ptr;
-    struct llm_mem_block *block;
-    unsigned long flags;
 
-    if (size == 0)
-        return NULL;
 
-    /* Allocate memory block tracker */
-    block = kmalloc(sizeof(*block), GFP_KERNEL);
-    if (!block)
-        return NULL;
-
-    /* Allocate requested memory */
-    ptr = kzalloc(size, GFP_KERNEL);
-    if (!ptr) {
-        kfree(block);
-        return NULL;
-    }
-
-    /* Initialize tracking info */
-    block->ptr = ptr;
-    block->size = size;
-    block->func = func;
-    block->line = line;
-
-    /* Update statistics */
-    spin_lock_irqsave(&mem_tracker.track_lock, flags);
-    atomic_inc(&mem_tracker.alloc_count);
-    atomic64_add(size, &mem_tracker.total_bytes);
-    list_add(&block->list, &mem_tracker.alloc_list);
-    spin_unlock_irqrestore(&mem_tracker.track_lock, flags);
-
-    return ptr;
-}
-
-/* Secure free with tracking */
-static inline void llm_free(void *ptr) {
-    struct llm_mem_block *block, *tmp;
-    unsigned long flags;
-
-    if (!ptr)
-        return;
-
-    spin_lock_irqsave(&mem_tracker.track_lock, flags);
-    list_for_each_entry_safe(block, tmp, &mem_tracker.alloc_list, list) {
-        if (block->ptr == ptr) {
-            /* Update statistics */
-            atomic_inc(&mem_tracker.free_count);
-            atomic64_sub(block->size, &mem_tracker.total_bytes);
-
-            /* Remove from tracking list */
-            list_del(&block->list);
-
-            /* Secure cleanup */
-            memzero_explicit(ptr, block->size);
-            kfree(ptr);
-            kfree(block);
-            break;
-        }
-    }
-    spin_unlock_irqrestore(&mem_tracker.track_lock, flags);
-}
-
-/* Memory leak detection */
-static void llm_check_leaks(void) {
-    struct llm_mem_block *block;
-    unsigned long flags;
-    int leak_count = 0;
-
-    spin_lock_irqsave(&mem_tracker.track_lock, flags);
-
-    list_for_each_entry(block, &mem_tracker.alloc_list, list) {
-        pr_err("LLM: Memory leak detected: %zu bytes allocated in %s:%d\n",
-               block->size, block->func, block->line);
-        leak_count++;
-    }
-
-    if (leak_count > 0) {
-        pr_err("LLM: Total memory leaks: %d\n", leak_count);
-        pr_err("LLM: Allocations: %d, Frees: %d, Total bytes: %lld\n",
-               atomic_read(&mem_tracker.alloc_count),
-               atomic_read(&mem_tracker.free_count),
-               atomic64_read(&mem_tracker.total_bytes));
-    }
-
-    spin_unlock_irqrestore(&mem_tracker.track_lock, flags);
-}
-
-#define llm_kmalloc(size) llm_malloc(size, __func__, __LINE__)
-#define llm_kfree(ptr) llm_free(ptr)
 static int init_ssl_session(struct ssl_context *ssl) {
     int ret;
     struct crypto_aead *tfm;
@@ -2000,99 +1912,90 @@ static int validate_message(const struct llm_message *msg)
 
 
 static void cleanup_connection(struct llm_connection *conn) {
-    if (!conn) return;
-
-    if (conn->ssl_enabled && conn->ssl_context) {
-        struct ssl_context *ssl = conn->ssl_context;
-        crypto_free_aead(ssl->tfm);
-        kfree(ssl);
+    if (!conn)
+        return;
+    if (conn->ssl_enabled && conn->tls) {
+        /* Free the TLS context (assumes crypto_free_aead is appropriate) */
+        crypto_free_aead(conn->tls->tfm);
+        kfree(conn->tls);
+        conn->tls = NULL;
     }
-
     if (conn->sock) {
         kernel_sock_shutdown(conn->sock, SHUT_RDWR);
         sock_release(conn->sock);
+        conn->sock = NULL;
     }
 }
-static int establish_ssl_connection(struct llm_connection *conn) {
+/* --- Revised TLS Connection Setup (using conn->tls) --- */
+static int establish_ssl_connection(struct llm_config *config,
+                                    struct llm_connection *conn) {
     int ret;
-    struct ssl_context *ssl = NULL;
+    struct tls_context *tls = NULL;
 
-    if (!conn) {
+    if (!conn)
         return -EINVAL;
-    }
 
-    /* Allocate SSL context with proper cleanup tracking */
-    ssl = kzalloc(sizeof(*ssl), GFP_KERNEL);
-    if (!ssl) {
+    tls = kzalloc(sizeof(*tls), GFP_KERNEL);
+    if (!tls)
         return -ENOMEM;
+
+    tls->tfm = crypto_alloc_aead("gcm(aes)", 0, CRYPTO_ALG_ASYNC);
+    if (IS_ERR(tls->tfm)) {
+        ret = PTR_ERR(tls->tfm);
+        goto cleanup_tls;
     }
 
-    /* Initialize crypto with proper error handling */
-    ssl->tfm = crypto_alloc_aead("gcm(aes)", 0, CRYPTO_ALG_ASYNC);
-    if (IS_ERR(ssl->tfm)) {
-        ret = PTR_ERR(ssl->tfm);
-        goto cleanup_ssl;
-    }
+    tls->key_size = crypto_aead_keysize(tls->tfm);
+    tls->iv_size = crypto_aead_ivsize(tls->tfm);
 
-    /* Get required sizes */
-    ssl->key_size = crypto_aead_keysize(ssl->tfm);
-    ssl->iv_size = crypto_aead_ivsize(ssl->tfm);
-
-    /* Allocate key and IV with proper cleanup */
-    ssl->key = kmalloc(ssl->key_size, GFP_KERNEL);
-    ssl->iv = kmalloc(ssl->iv_size, GFP_KERNEL);
-    if (!ssl->key || !ssl->iv) {
+    tls->key = kmalloc(tls->key_size, GFP_KERNEL);
+    tls->iv = kmalloc(tls->iv_size, GFP_KERNEL);
+    if (!tls->key || !tls->iv) {
         ret = -ENOMEM;
         goto cleanup_crypto;
     }
 
-    /* Generate random key material */
-    get_random_bytes(ssl->key, ssl->key_size);
-    get_random_bytes(ssl->iv, ssl->iv_size);
+    get_random_bytes(tls->key, tls->key_size);
+    get_random_bytes(tls->iv, tls->iv_size);
 
-    /* Set key with error handling */
-    ret = crypto_aead_setkey(ssl->tfm, ssl->key, ssl->key_size);
-    if (ret) {
+    ret = crypto_aead_setkey(tls->tfm, tls->key, tls->key_size);
+    if (ret)
         goto cleanup_key_iv;
-    }
 
-    /* Allocate and initialize scatterlists */
-    ssl->sg_tx = kcalloc(2, sizeof(struct scatterlist), GFP_KERNEL);
-    ssl->sg_rx = kcalloc(2, sizeof(struct scatterlist), GFP_KERNEL);
-    if (!ssl->sg_tx || !ssl->sg_rx) {
+    tls->sg_tx = kcalloc(2, sizeof(struct scatterlist), GFP_KERNEL);
+    tls->sg_rx = kcalloc(2, sizeof(struct scatterlist), GFP_KERNEL);
+    if (!tls->sg_tx || !tls->sg_rx) {
         ret = -ENOMEM;
         goto cleanup_key_iv;
     }
+    sg_init_table(tls->sg_tx, 2);
+    sg_init_table(tls->sg_rx, 2);
 
-    sg_init_table(ssl->sg_tx, 2);
-    sg_init_table(ssl->sg_rx, 2);
-
-    /* Allocate request */
-    ssl->req = aead_request_alloc(ssl->tfm, GFP_KERNEL);
-    if (!ssl->req) {
+    tls->req = aead_request_alloc(tls->tfm, GFP_KERNEL);
+    if (!tls->req) {
         ret = -ENOMEM;
         goto cleanup_scatterlists;
     }
 
-    conn->ssl_context = ssl;
+    conn->tls = tls;
     return 0;
 
 cleanup_scatterlists:
-    kfree(ssl->sg_tx);
-    kfree(ssl->sg_rx);
+    kfree(tls->sg_tx);
+    kfree(tls->sg_rx);
 cleanup_key_iv:
-    if (ssl->key) {
-        memzero_explicit(ssl->key, ssl->key_size);
-        kfree(ssl->key);
+    if (tls->key) {
+        memzero_explicit(tls->key, tls->key_size);
+        kfree(tls->key);
     }
-    if (ssl->iv) {
-        memzero_explicit(ssl->iv, ssl->iv_size);
-        kfree(ssl->iv);
+    if (tls->iv) {
+        memzero_explicit(tls->iv, tls->iv_size);
+        kfree(tls->iv);
     }
 cleanup_crypto:
-    crypto_free_aead(ssl->tfm);
-cleanup_ssl:
-    kfree(ssl);
+    crypto_free_aead(tls->tfm);
+cleanup_tls:
+    kfree(tls);
     return ret;
 }
 static int establish_connection(struct llm_config *config,
@@ -2214,6 +2117,117 @@ static int send_http_request(struct llm_connection *conn,
 
     return 0;
 }
+
+/* Send an HTTP request to Anthropic's API.
+ * The function builds an HTTP POST request using Anthropic’s expected endpoint
+ * and header for the API key.
+ */
+static int send_anthropic_request(struct llm_connection *conn,
+                                  struct llm_json_buffer *buf)
+{
+    struct msghdr msg = {0};
+    struct kvec iov[2];
+    char headers[512];
+    int ret;
+
+    ret = snprintf(headers, sizeof(headers),
+                   "POST /v1/complete HTTP/1.1\r\n"
+                   "Host: api.anthropic.com\r\n"
+                   "Anthropic-Api-Key: %s\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Content-Length: %zu\r\n"
+                   "\r\n",
+                   conn->config->api_key, buf->used);
+    if (ret >= sizeof(headers))
+        return -EOVERFLOW;
+
+    iov[0].iov_base = headers;
+    iov[0].iov_len = ret;
+    iov[1].iov_base = buf->data;
+    iov[1].iov_len = buf->used;
+
+    ret = kernel_sendmsg(conn->sock, &msg, iov, 2, ret + buf->used);
+    if (ret < 0)
+        return ret;
+    return 0;
+}
+
+/* Send a message to Anthropic. This function is analogous to llm_send_message
+ * for OpenAI but builds and sends the Anthropic-specific request.
+ */
+int llm_send_anthropic_message(struct llm_config *config, struct llm_message *msg)
+{
+    struct llm_connection conn = {0};
+    struct llm_json_buffer req_buf = {0};
+    int ret;
+
+    if (!config || !msg)
+        return -EINVAL;
+
+    ret = validate_message(msg);
+    if (ret != 0)
+        return ret;
+
+    ret = check_rate_limit(config);
+    if (ret != 0)
+        return ret;
+
+    ret = format_anthropic_request_json(config, msg, &req_buf);
+    if (ret != 0)
+        return ret;
+
+    ret = establish_connection(config, &conn);
+    if (ret != 0)
+        goto cleanup_buf;
+
+    ret = send_anthropic_request(&conn, &req_buf);
+
+cleanup_conn:
+    cleanup_connection(&conn);
+cleanup_buf:
+    llm_json_buffer_free(&req_buf);
+    return ret;
+}
+
+/* Receive Anthropic response.
+ * For simplicity, this function reuses the existing HTTP response reception and JSON
+ * parsing routines from the OpenAI code. In practice Anthropic’s JSON response may have
+ * a different structure and require a dedicated parser.
+ */
+int llm_receive_anthropic_response(struct llm_config *config, struct llm_response *resp)
+{
+    struct llm_connection conn;
+    char *buffer;
+    int ret;
+
+    if (!config || !resp)
+        return -EINVAL;
+
+    buffer = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
+    if (!buffer)
+        return -ENOMEM;
+
+    ret = establish_connection(config, &conn);
+    if (ret)
+        goto cleanup_buffer;
+
+    ret = receive_http_response(&conn, resp, buffer, MAX_RESPONSE_LENGTH);
+    if (ret < 0)
+        goto cleanup_conn;
+
+    /* If Anthropic's response format differs, adjust the parsing accordingly.
+     * Here we assume a similar JSON structure to OpenAI.
+     */
+    ret = parse_json_response(buffer, ret, resp);
+
+cleanup_conn:
+    cleanup_connection(&conn);
+cleanup_buffer:
+    memzero_explicit(buffer, MAX_RESPONSE_LENGTH);
+    kfree(buffer);
+    return ret;
+}
+
 static int receive_http_response(struct llm_connection *conn,
                                struct llm_response *resp,
                                char *buffer,
@@ -2456,19 +2470,22 @@ static int llm_release(struct inode *inode, struct file *file) {
     return 0;
 }
 
+/* --- Additional Error Checks in User I/O --- */
 static ssize_t llm_read(struct file *file, char __user *buf,
-                       size_t count, loff_t *offset) {
+                        size_t count, loff_t *offset) {
     struct llm_response resp;
     int ret;
 
-    /* Get response from OpenAI */
     ret = llm_receive_response(global_config, &resp);
     if (ret < 0)
         return ret;
 
-    /* Copy to user space */
+    /* Check that a valid response message exists */
+    if (!resp.message || !resp.message->content)
+        return -EFAULT;
+
     if (copy_to_user(buf, resp.message->content,
-                    resp.message->content_length))
+                     resp.message->content_length))
         return -EFAULT;
 
     return resp.message->content_length;
@@ -2576,93 +2593,7 @@ int llm_add_message(struct llm_config *config, struct llm_message *msg) {
     return 0;
 }
 
-/* Tool Management */
-struct llm_tool *llm_tool_alloc(const char *name, const char *description)
-{
-    struct llm_tool *tool;
 
-    if (!name || !description)
-        return NULL;
-
-    tool = kmalloc(sizeof(*tool), GFP_KERNEL);
-    if (!tool)
-        return NULL;
-
-    strncpy(tool->name, name, MAX_TOOL_NAME - 1);
-    tool->name[MAX_TOOL_NAME - 1] = '\0';
-
-    strncpy(tool->description, description, MAX_TOOL_DESC - 1);
-    tool->description[MAX_TOOL_DESC - 1] = '\0';
-
-    INIT_LIST_HEAD(&tool->parameters);
-    INIT_LIST_HEAD(&tool->list);
-
-    return tool;
-}
-static void cleanup_tools(struct llm_config *config)
-{
-    struct llm_tool *tool, *tmp_tool;
-    struct llm_tool_param *param, *tmp_param;
-
-    list_for_each_entry_safe(tool, tmp_tool, &config->tools, list) {
-        list_for_each_entry_safe(param, tmp_param, &tool->parameters, list) {
-            list_del(&param->list);
-            kfree(param);
-        }
-        list_del(&tool->list);
-        llm_tool_free(tool);
-    }
-}
-void llm_tool_free(struct llm_tool *tool)
-{
-    struct llm_tool_param *param, *tmp;
-
-    if (!tool)
-        return;
-
-    list_for_each_entry_safe(param, tmp, &tool->parameters, list) {
-        list_del(&param->list);
-        kfree(param);
-    }
-
-    kfree(tool);
-}
-
-int llm_add_tool_param(struct llm_tool *tool, const char *name,
-                      const char *description, bool required)
-{
-    struct llm_tool_param *param;
-
-    if (!tool || !name || !description)
-        return -EINVAL;
-
-    param = kmalloc(sizeof(*param), GFP_KERNEL);
-    if (!param)
-        return -ENOMEM;
-
-    strncpy(param->name, name, MAX_TOOL_NAME - 1);
-    param->name[MAX_TOOL_NAME - 1] = '\0';
-
-    strncpy(param->description, description, MAX_TOOL_DESC - 1);
-    param->description[MAX_TOOL_DESC - 1] = '\0';
-
-    param->required = required;
-    INIT_LIST_HEAD(&param->list);
-
-    list_add_tail(&param->list, &tool->parameters);
-    return 0;
-}
-
-/* Replace global mutex with config-specific locks */
-int llm_add_tool(struct llm_config *config, struct llm_tool *tool) {
-    if (!config || !tool)
-        return -EINVAL;
-
-    mutex_lock(&config->tool_lock);
-    list_add_tail(&tool->list, &config->tools);
-    mutex_unlock(&config->tool_lock);
-    return 0;
-}
 
 /* Main Interface Implementation */
 
