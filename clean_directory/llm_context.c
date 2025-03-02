@@ -53,6 +53,9 @@ static struct conversation_context *create_conversation(int conversation_id)
  * Add a new entry to the conversation context
  * Returns 0 on success, negative error code on failure
  */
+/*
+ * Add a new entry to the conversation context
+ */
 int context_add_entry(int conversation_id, const char *role, const char *content)
 {
     struct conversation_context *ctx;
@@ -64,8 +67,6 @@ int context_add_entry(int conversation_id, const char *role, const char *content
         return -EINVAL;
 
     spin_lock_irqsave(&conversations_lock, flags);
-
-    /* Find or create conversation context */
     ctx = find_conversation(conversation_id);
     if (!ctx) {
         ctx = create_conversation(conversation_id);
@@ -75,17 +76,15 @@ int context_add_entry(int conversation_id, const char *role, const char *content
         }
         list_add(&ctx->list, &conversation_list);
     }
-
     spin_unlock_irqrestore(&conversations_lock, flags);
 
-    /* Allocate new entry */
     entry = kmalloc(sizeof(*entry), GFP_KERNEL);
     if (!entry)
         return -ENOMEM;
 
-    /* Copy role and content */
-    if (strlcpy(entry->role, role, sizeof(entry->role)) >= sizeof(entry->role) ||
-        strlcpy(entry->content, content, sizeof(entry->content)) >= sizeof(entry->content)) {
+    /* Use strscpy (kernel-approved) to copy strings */
+    if (strscpy(entry->role, role, sizeof(entry->role)) >= sizeof(entry->role) ||
+        strscpy(entry->content, content, sizeof(entry->content)) >= sizeof(entry->content)) {
         kfree(entry);
         return -EINVAL; /* Strings were truncated */
     }
@@ -93,10 +92,7 @@ int context_add_entry(int conversation_id, const char *role, const char *content
     entry->timestamp = ktime_get();
     INIT_LIST_HEAD(&entry->list);
 
-    /* Add entry to conversation */
     spin_lock_irqsave(&ctx->lock, flags);
-
-    /* If we reached the maximum number of entries, remove the oldest one */
     if (ctx->entry_count >= MAX_CONTEXT_ENTRIES) {
         struct context_entry *oldest;
         oldest = list_first_entry(&ctx->entries, struct context_entry, list);
@@ -105,57 +101,57 @@ int context_add_entry(int conversation_id, const char *role, const char *content
         ctx->entry_count--;
         pr_debug("Removed oldest entry from conversation %d to make room\n", conversation_id);
     }
-
     list_add_tail(&entry->list, &ctx->entries);
     ctx->entry_count++;
     ctx->last_updated = ktime_get();
-
     spin_unlock_irqrestore(&ctx->lock, flags);
 
     pr_debug("Added new entry to conversation %d, role: %s, content length: %zu\n",
              conversation_id, role, strlen(content));
-
     return ret;
 }
+
 
 /*
  * Generate JSON representation of a conversation context
  * Returns 0 on success, negative error code on failure
  */
+/*
+ * Generate JSON representation of a conversation context
+ */
 int context_get_conversation(int conversation_id, struct llm_json_buffer *json_buf)
 {
     struct conversation_context *ctx;
     struct context_entry *entry;
-    unsigned long flags, entry_flags;
+    unsigned long flags;
     int ret = 0;
     bool first = true;
+    char *entry_json;
 
     if (!json_buf || !json_buf->data || conversation_id <= 0)
         return -EINVAL;
 
     spin_lock_irqsave(&conversations_lock, flags);
-
-    /* Find conversation context */
     ctx = find_conversation(conversation_id);
     if (!ctx) {
         spin_unlock_irqrestore(&conversations_lock, flags);
         pr_debug("Conversation %d not found\n", conversation_id);
         return -ENOENT;
     }
-
     spin_unlock_irqrestore(&conversations_lock, flags);
 
-    /* Start array */
     ret = append_json_string(json_buf, "[");
-    if (ret) {
+    if (ret)
         return ret;
-    }
 
-    spin_lock_irqsave(&ctx->lock, entry_flags);
+    /* Dynamically allocate a temporary buffer to build each entry's JSON */
+    entry_json = kmalloc(512, GFP_KERNEL);
+    if (!entry_json)
+        return -ENOMEM;
 
-    /* Add each entry */
+    /* Hold the conversation lock while iterating over entries */
+    spin_lock_irqsave(&ctx->lock, flags);
     list_for_each_entry(entry, &ctx->entries, list) {
-        char entry_json[MAX_PAYLOAD_SIZE];
         size_t entry_len = 0;
 
         if (!first) {
@@ -165,59 +161,43 @@ int context_get_conversation(int conversation_id, struct llm_json_buffer *json_b
         }
         first = false;
 
-        /* Pre-format entry JSON in a local buffer */
-        ret = snprintf(entry_json, sizeof(entry_json),
-                       "{\"role\":\"%s\",\"content\":\"", entry->role);
-        if (ret < 0 || ret >= sizeof(entry_json)) {
+        /* Format the beginning of the entry JSON into the dynamic buffer */
+        ret = snprintf(entry_json, 512, "{\"role\":\"%s\",\"content\":\"", entry->role);
+        if (ret < 0 || ret >= 512) {
             ret = -ENOSPC;
             break;
         }
         entry_len = ret;
-
-        /* Ensure space for value and closing braces */
-        if (entry_len + 20 >= sizeof(entry_json)) {
+        if (entry_len + 20 >= 512) {
             ret = -ENOSPC;
             break;
         }
 
-        spin_unlock_irqrestore(&ctx->lock, entry_flags);
-
-        /* Append the pre-formatted string to the JSON buffer */
         ret = append_json_string(json_buf, entry_json);
-        if (ret) {
-            spin_lock_irqsave(&ctx->lock, entry_flags);
+        if (ret)
             break;
-        }
 
-        /* Append the escaped content value */
         ret = append_json_value(json_buf, entry->content);
-        if (ret) {
-            spin_lock_irqsave(&ctx->lock, entry_flags);
+        if (ret)
             break;
-        }
 
-        /* Append closing braces */
         ret = append_json_string(json_buf, "\"}");
-        if (ret) {
-            spin_lock_irqsave(&ctx->lock, entry_flags);
+        if (ret)
             break;
-        }
-
-        spin_lock_irqsave(&ctx->lock, entry_flags);
     }
+    spin_unlock_irqrestore(&ctx->lock, flags);
 
-    spin_unlock_irqrestore(&ctx->lock, entry_flags);
+    kfree(entry_json);
 
-    /* End array */
-    if (!ret) {
+    if (!ret)
         ret = append_json_string(json_buf, "]");
-    }
 
     pr_debug("Generated JSON for conversation %d with %d entries\n",
              conversation_id, ctx->entry_count);
-
     return ret;
 }
+
+
 
 /*
  * Get the number of entries in a conversation
@@ -412,17 +392,16 @@ int append_json_number(struct llm_json_buffer *buf, int number)
 int append_json_float(struct llm_json_buffer *buf, int value_x100)
 {
     char value[32];
-    int ret;
-    
-    if (!buf || !buf->data)
-        return -EINVAL;
-        
-    ret = snprintf(value, sizeof(value), "%.2f", (float)value_x100 / 100.0f);
+    int int_part, frac_part, ret;
+
+    int_part = value_x100 / 100;
+    frac_part = value_x100 % 100;
+    ret = snprintf(value, sizeof(value), "%d.%02d", int_part, frac_part);
     if (ret < 0 || ret >= sizeof(value))
         return -EINVAL;
-        
     return append_json_string(buf, value);
 }
+
 
 /*
  * Helper function to append a JSON boolean

@@ -206,4 +206,7 @@ int parse_token_count(const char *json, int *prompt_tokens, int *completion_toke
 const char *get_default_model(int provider);
 bool is_model_supported(int provider, const char *model_name);
 
+struct scheduler_state *get_scheduler_state(void);
+void set_scheduler_state(struct scheduler_state *state);
+
 #endif /* LLM_ORCHESTRATOR_H */

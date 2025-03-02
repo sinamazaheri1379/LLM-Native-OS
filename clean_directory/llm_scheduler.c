@@ -710,33 +710,25 @@ void handle_rate_limit(int provider, struct scheduler_state *state, unsigned lon
 int select_provider(struct llm_request *req, struct scheduler_state *state)
 {
     int provider = -1;
-    unsigned long flags;
     int current_algorithm;
-    
+
     if (!req || !state)
         return -EINVAL;
-        
-    /* If user specified a preference, use that */
+
     if (req->provider_preference >= 0 && req->provider_preference < PROVIDER_COUNT) {
-        /* Check if preferred provider is rate limited */
-        if (check_rate_limit(req->provider_preference, state) == 0) {
+        if (check_rate_limit(req->provider_preference, state) == 0)
             return req->provider_preference;
-        } else {
-            pr_warn("Preferred provider %d is rate limited, falling back to scheduler\n", 
-                   req->provider_preference);
-        }
+        else
+            pr_warn("Preferred provider %d is rate limited, falling back to scheduler\n",
+                    req->provider_preference);
     }
-    
-    /* Use the algorithm specified in the request, or the default */
-    if (req->scheduler_algorithm >= 0 && req->scheduler_algorithm <= SCHEDULER_FIFO) {
+
+    if (req->scheduler_algorithm >= 0 && req->scheduler_algorithm <= SCHEDULER_FIFO)
         atomic_set(&state->current_algorithm, req->scheduler_algorithm);
-    }
-    
+
     current_algorithm = atomic_read(&state->current_algorithm);
-    
-    /* Try to select a provider that's not rate limited */
+
     for (int attempt = 0; attempt < 3; attempt++) {
-        /* Select provider based on current algorithm */
         switch (current_algorithm) {
             case SCHEDULER_ROUND_ROBIN:
                 provider = round_robin_scheduler(state);
@@ -763,27 +755,18 @@ int select_provider(struct llm_request *req, struct scheduler_state *state)
                 provider = round_robin_scheduler(state);
                 break;
         }
-        
-        /* Check if selected provider is rate limited */
-        if (check_rate_limit(provider, state) == 0) {
+        if (check_rate_limit(provider, state) == 0)
             break;
-        }
-        
-        /* If rate limited, try a different algorithm for next attempt */
         pr_debug("Provider %d is rate limited, trying different algorithm\n", provider);
         current_algorithm = (current_algorithm + 1) % (SCHEDULER_FIFO + 1);
-        
-        /* Small delay to prevent tight loop */
-        if (attempt < 2) {
-            usleep_range(10000, 20000); /* 10-20ms */
-        }
+        if (attempt < 2)
+            usleep_range(10000, 20000); /* 10-20ms delay */
     }
-    
-    /* Log the selected provider and algorithm */
+
     pr_debug("Selected provider %d using algorithm %d\n", provider, current_algorithm);
-    
     return provider;
 }
+
 
 /*
  * Model management helper functions
