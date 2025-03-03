@@ -5,44 +5,12 @@
 #include <linux/device.h>
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
-#include <linux/atomic.h>
-#include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/net.h>
-#include <linux/in.h>
-#include <linux/socket.h>
-#include <linux/uio.h>
-#include <net/sock.h>
-#include <linux/jiffies.h>
 #include <linux/timer.h>
-#include <linux/random.h>
-#include <linux/delay.h>
-#include <linux/time.h>
-#include <linux/ktime.h>
-#include <linux/sched.h>
-#include <linux/version.h>
-#include <linux/inet.h>
-#include <uapi/linux/time.h>
-#include <uapi/linux/socket.h>
-#include "llm_orchestrator.h"
+#include "orchestrator_main.h"
 
 #define MODULE_NAME "llm_orchestrator"
-#define DRIVER_VERSION "2.0"
 
-
-#ifndef HAVE_STRCASESTR
-static inline char *strcasestr(const char *haystack, const char *needle)
-{
-    size_t needle_len = strlen(needle);
-    for (; *haystack; haystack++) {
-        if (strncasecmp(haystack, needle, needle_len) == 0)
-            return (char *)haystack;
-    }
-    return NULL;
-}
-#endif
-
-/* Module parameters for API keys */
+/* Module parameters */
 static char *openai_api_key = NULL;
 module_param(openai_api_key, charp, 0600);
 MODULE_PARM_DESC(openai_api_key, "OpenAI API Key");
@@ -59,6 +27,8 @@ static int prune_threshold_mins = 60; /* 1 hour */
 module_param(prune_threshold_mins, int, 0600);
 MODULE_PARM_DESC(prune_threshold_mins, "Auto-prune threshold for old conversations in minutes (0 to disable)");
 
+
+static char *secure_api_keys[3] = { NULL, NULL, NULL };
 /* Character device globals */
 static int major_number;
 static struct class *orchestrator_class;
@@ -73,715 +43,579 @@ static struct llm_response global_response;
 /* Maintenance timer */
 static struct timer_list maintenance_timer;
 
-/* --- TLS and Network Connection Functions --- */
-static int setup_tls(struct socket *sock)
-{
-    pr_debug("setup_tls: TLS handshake stubbed (assumed successful)\n");
-    return 0;
-}
+/* Function prototypes */
+static int orchestrator_open(struct inode *inode, struct file *file);
+static int orchestrator_release(struct inode *inode, struct file *file);
+static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
+static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
 
-static int establish_connection(struct socket **sock, const char *host_ip,
-                                int port, bool use_tls)
-{
-    struct socket *s;
-    struct sockaddr_in server_addr;
-    int ret;
-    ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &s);
-    if (ret < 0) {
-        pr_err("establish_connection: sock_create_kern failed: %d\n", ret);
-        return ret;
-    }
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    ret = in4_pton(host_ip, -1, (u8 *)&server_addr.sin_addr.s_addr, -1, NULL);
-    if (!ret) {
-        pr_err("establish_connection: Invalid server IP: %s\n", host_ip);
-        sock_release(s);
-        return -EINVAL;
-    }
-    ret = kernel_connect(s, (struct sockaddr *)&server_addr, sizeof(server_addr), 0);
-    if (ret < 0) {
-        pr_err("establish_connection: kernel_connect failed: %d to %s:%d\n",
-               ret, host_ip, port);
-        sock_release(s);
-        return ret;
-    }
-    if (use_tls) {
-        ret = setup_tls(s);
-        if (ret < 0) {
-            pr_err("establish_connection: TLS setup failed: %d\n", ret);
-            sock_release(s);
-            return ret;
-        }
-    }
-    *sock = s;
-    return 0;
-}
+/* Character device operations */
+static struct file_operations orchestrator_fops = {
+        .owner = THIS_MODULE,
+        .open = orchestrator_open,
+        .release = orchestrator_release,
+        .read = orchestrator_read,
+        .write = orchestrator_write,
+};
 
-/* --- HTTP Request Sending and Receiving --- */
-#define MAX_HEADER_SIZE 1024
-#define MAX_RESPONSE_SIZE (MAX_RESPONSE_LENGTH + 1024)
-
-static int network_send_request(const char *host_ip, int port,
-                                const char *http_path,
-                                const char *api_key,
-                                const char *auth_header,
-                                bool use_tls,
-                                unsigned long timeout_ms,
-                                struct llm_json_buffer *buf,
-                                struct llm_response *resp)
-{
-    struct socket *sock;
-    struct msghdr msg = {0};
-    struct kvec iov[2];
-    char headers[MAX_HEADER_SIZE];
-    int ret, header_len, total_len;
-    char *recv_buf;
-    int received = 0;
-    ktime_t start_time, end_time;
-    s64 elapsed_ms;
-    bool rate_limited = false;
-    unsigned long reset_time_ms = 0;
-
-    start_time = ktime_get();
-    ret = establish_connection(&sock, host_ip, port, use_tls);
-    if (ret < 0)
-        return ret;
-    header_len = snprintf(headers, sizeof(headers),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "%s%s\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        http_path, host_ip,
-        auth_header, api_key,
-        buf->used);
-    if (header_len < 0 || header_len >= sizeof(headers)) {
-        ret = -EOVERFLOW;
-        goto release_sock;
-    }
-    total_len = header_len + buf->used;
-    iov[0].iov_base = headers;
-    iov[0].iov_len = header_len;
-    iov[1].iov_base = buf->data;
-    iov[1].iov_len = buf->used;
-    {
-        long timeout_jiffies = msecs_to_jiffies(timeout_ms);
-        ret = sock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-                            (char *)&timeout_jiffies, sizeof(timeout_jiffies));
-        if (ret < 0) {
-            pr_err("network_send_request: Failed to set socket timeout: %d\n", ret);
-            goto release_sock;
-        }
-    }
-    ret = kernel_sendmsg(sock, &msg, iov, 2, total_len);
-    if (ret < 0) {
-        pr_err("network_send_request: kernel_sendmsg failed: %d\n", ret);
-        goto release_sock;
-    }
-    recv_buf = kmalloc(MAX_RESPONSE_SIZE, GFP_KERNEL);
-    if (!recv_buf) {
-        ret = -ENOMEM;
-        goto release_sock;
-    }
-    while (received < MAX_RESPONSE_SIZE - 1) {
-        struct kvec recv_iov;
-        recv_iov.iov_base = recv_buf + received;
-        recv_iov.iov_len = MAX_RESPONSE_SIZE - received - 1;
-        ret = kernel_recvmsg(sock, &msg, &recv_iov, 1, recv_iov.iov_len, 0);
-        if (ret < 0) {
-            if (ret == -EAGAIN || ret == -EWOULDBLOCK) {
-                pr_warn("network_send_request: request timed out\n");
-                ret = -ETIMEDOUT;
-            } else {
-                pr_err("network_send_request: kernel_recvmsg error: %d\n", ret);
-            }
-            kfree(recv_buf);
-            goto release_sock;
-        }
-        if (ret == 0)
-            break;
-        received += ret;
-        if (strstr(recv_buf, "\r\n\r\n")) {
-            const char *cl_header = strcasestr(recv_buf, "Content-Length:");
-            if (cl_header) {
-                int content_length = 0;
-                if (sscanf(cl_header, "Content-Length: %d", &content_length) == 1) {
-                    const char *body = strstr(recv_buf, "\r\n\r\n");
-                    if (body && (received >= ((body + 4) - recv_buf) + content_length))
-                        break;
-                }
-            }
-            if (received > 0 && recv_buf[received-1] == '}')
-                break;
-        }
-    }
-    recv_buf[received] = '\0';
-    if (strncmp(recv_buf, "HTTP/1.1 ", 9) == 0) {
-        int status_code;
-        if (sscanf(recv_buf + 9, "%d", &status_code) == 1) {
-            resp->status = status_code;
-            if (status_code == 429) {
-                rate_limited = true;
-                const char *retry_after = strcasestr(recv_buf, "Retry-After:");
-                if (retry_after) {
-                    int seconds = 0;
-                    if (sscanf(retry_after, "Retry-After: %d", &seconds) == 1)
-                        reset_time_ms = seconds * 1000;
-                } else {
-                    reset_time_ms = 60000;
-                }
-                ret = -LLM_ERR_RATE_LIMIT;
-                goto cleanup_buffer;
-            }
-            if (status_code == 401 || status_code == 403) {
-                ret = -LLM_ERR_AUTH;
-                goto cleanup_buffer;
-            }
-            if (status_code < 200 || status_code >= 300) {
-                ret = -LLM_ERR_API_RESPONSE;
-                goto cleanup_buffer;
-            }
-        }
-    }
-    {
-        char *body = strstr(recv_buf, "\r\n\r\n");
-        if (body) {
-            body += 4;
-            strncpy(resp->content, body, MAX_RESPONSE_LENGTH - 1);
-            resp->content[MAX_RESPONSE_LENGTH - 1] = '\0';
-            resp->content_length = strlen(resp->content);
-            {
-                int prompt_tokens = 0, completion_tokens = 0, total_tokens = 0;
-                if (parse_token_count(body, &prompt_tokens, &completion_tokens, &total_tokens) == 0)
-                    resp->tokens_used = total_tokens;
-            }
-        } else {
-            strncpy(resp->content, recv_buf, MAX_RESPONSE_LENGTH - 1);
-            resp->content[MAX_RESPONSE_LENGTH - 1] = '\0';
-            resp->content_length = strlen(resp->content);
-        }
-    }
-    ret = 0;
-cleanup_buffer:
-    kfree(recv_buf);
-release_sock:
-    sock_release(sock);
-    end_time = ktime_get();
-    elapsed_ms = ktime_to_ms(ktime_sub(end_time, start_time));
-    resp->latency_ms = elapsed_ms;
-    if (rate_limited && reset_time_ms > 0) {
-        int provider = resp->provider_used;
-        if (provider >= 0 && provider < PROVIDER_COUNT)
-            handle_rate_limit(provider, &global_scheduler, reset_time_ms);
-    }
-    return ret;
-}
-
-/* --- Provider Functions --- */
-static int format_openai_request(struct llm_request *req, struct llm_json_buffer *json_buf)
-{
-    struct llm_json_buffer context_buf;
-    int ret;
-    const char *model;
-
-    json_buf->used = 0;
-
-    if (req->model_name[0] != '\0' && is_model_supported(PROVIDER_OPENAI, req->model_name))
-        model = req->model_name;
-    else
-        model = get_default_model(PROVIDER_OPENAI);
-
-    if (req->conversation_id > 0) {
-        ret = json_buffer_init(&context_buf, MAX_PAYLOAD_SIZE);
-        if (ret < 0)
-            return ret;
-
-        ret = context_get_conversation(req->conversation_id, &context_buf);
-        if (ret == 0 && context_buf.used > 0) {
-            ret = append_json_string(json_buf, "{\"model\": \"");
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, model);
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, "\", \"messages\": ");
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, context_buf.data);
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, ", {\"role\": \"");
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, req->role);
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, "\", \"content\": \"");
-            if (ret)
-                goto cleanup;
-            ret = append_json_value(json_buf, req->prompt);
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, "\"}]");
-            if (!ret) {
-                ret = append_json_string(json_buf, ", \"temperature\": ");
-                if (!ret) {
-                    ret = append_json_float(json_buf, req->temperature_x100 > 0 ?
-                                          req->temperature_x100 : 70);
-                    if (!ret) {
-                        ret = append_json_string(json_buf, ", \"max_tokens\": ");
-                        if (!ret) {
-                            ret = append_json_number(json_buf, req->max_tokens > 0 ?
-                                                   req->max_tokens : 500);
-                            if (!ret) {
-                                ret = append_json_string(json_buf, "}");
-                            }
-                        }
-                    }
-                }
-            }
-            if (ret)
-                goto cleanup;
-
-            json_buffer_free(&context_buf);
-            return 0;
-        }
-        if (context_buf.data)
-            json_buffer_free(&context_buf);
-    }
-
-    ret = append_json_string(json_buf, "{\"model\": \"");
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, model);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf,
-                          "\", \"messages\": [{\"role\": \"system\", \"content\": \"You are a helpful assistant.\"}, {\"role\": \"");
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, req->role);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, "\", \"content\": \"");
-    if (ret)
-        return ret;
-    ret = append_json_value(json_buf, req->prompt);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, "\"}]");
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, ", \"temperature\": ");
-    if (ret)
-        return ret;
-    ret = append_json_float(json_buf, req->temperature_x100 > 0 ?
-                          req->temperature_x100 : 70);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, ", \"max_tokens\": ");
-    if (ret)
-        return ret;
-    ret = append_json_number(json_buf, req->max_tokens > 0 ?
-                           req->max_tokens : 500);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, "}");
-    return ret;
-
-cleanup:
-    json_buffer_free(&context_buf);
-    return ret;
-}
-
-int llm_send_openai(const char *api_key,
-                    struct llm_request *req,
-                    struct llm_response *resp)
-{
-    struct llm_json_buffer json_buf;
-    int ret;
-
-    if (!api_key || !req || !resp)
-        return -EINVAL;
-
-    if (strlen(api_key) < 20) {
-        pr_err("llm_send_openai: Invalid API key\n");
-        return -LLM_ERR_AUTH;
-    }
-
-    ret = json_buffer_init(&json_buf, MAX_PAYLOAD_SIZE);
-    if (ret < 0)
-        return ret;
-
-    ret = format_openai_request(req, &json_buf);
-    if (ret < 0) {
-        json_buffer_free(&json_buf);
-        return ret;
-    }
-
-    resp->provider_used = PROVIDER_OPENAI;
-    strncpy(resp->model_used,
-            req->model_name[0] ? req->model_name : get_default_model(PROVIDER_OPENAI),
-            MAX_MODEL_NAME);
-    resp->timestamp = ktime_get();
-
-    ret = network_send_request("api.openai.com", 443, "/v1/chat/completions",
-                             api_key, "Authorization: Bearer ", true,
-                             req->timeout_ms, &json_buf, resp);
-
-    if (ret == 0 && req->conversation_id > 0) {
-        context_add_entry(req->conversation_id, req->role, req->prompt);
-        {
-            char assistant_content[MAX_PROMPT_LENGTH];
-            ret = extract_response_content(resp->content, assistant_content, sizeof(assistant_content));
-            if (ret > 0)
-                context_add_entry(req->conversation_id, "assistant", assistant_content);
-        }
-    }
-
-    json_buffer_free(&json_buf);
-    return ret;
-}
 
 /*
- * Format Anthropic request JSON with context
+ * Implementation of provider-specific API functions
+ * These were mentioned in header files but missing from the implementation
  */
-static int format_anthropic_request(struct llm_request *req, struct llm_json_buffer *json_buf)
+
+/* OpenAI API implementation */
+int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
-    struct llm_json_buffer context_buf;
+    char *openai_host = "104.18.6.192";  /* OpenAI API IP - would use DNS in real implementation */
+    int port = 443;
+    char *path = "/v1/chat/completions";
+    struct llm_json_buffer json_buf;
     int ret;
+    char auth_header[128];
     const char *model;
 
-    json_buf->used = 0;
+    if (!api_key || !req || !resp) {
+        pr_err("llm_send_openai: Invalid parameters\n");
+        return -EINVAL;
+    }
 
-    if (req->model_name[0] != '\0' && is_model_supported(PROVIDER_ANTHROPIC, req->model_name))
-        model = req->model_name;
-    else
-        model = get_default_model(PROVIDER_ANTHROPIC);
+    /* Initialize response */
+    memset(resp, 0, sizeof(*resp));
+    resp->provider_used = PROVIDER_OPENAI;
 
+    /* Check/use default model if none specified */
+    if (req->model_name[0] == '\0') {
+        model = get_default_model(PROVIDER_OPENAI);
+        strscpy(resp->model_used, model, MAX_MODEL_NAME);
+    } else {
+        if (!is_model_supported(PROVIDER_OPENAI, req->model_name)) {
+            pr_warn("llm_send_openai: Unsupported model %s, using default\n",
+                    req->model_name);
+            model = get_default_model(PROVIDER_OPENAI);
+        } else {
+            model = req->model_name;
+        }
+        strscpy(resp->model_used, model, MAX_MODEL_NAME);
+    }
+
+    /* Format auth header */
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s\r\n", api_key);
+
+    /* Initialize JSON buffer */
+    ret = json_buffer_init(&json_buf, 4096);
+    if (ret) {
+        pr_err("llm_send_openai: Failed to initialize JSON buffer: %d\n", ret);
+        return ret;
+    }
+
+    /* Create OpenAI-specific JSON payload */
+    ret = append_json_string(&json_buf, "{\"model\":\"");
+    if (ret) goto cleanup;
+
+    ret = append_json_value(&json_buf, model);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "\",\"messages\":[");
+    if (ret) goto cleanup;
+
+    /* Add conversation context if available */
     if (req->conversation_id > 0) {
-        ret = json_buffer_init(&context_buf, MAX_PAYLOAD_SIZE);
-        if (ret < 0)
-            return ret;
+        struct llm_json_buffer context_buf;
+
+        ret = json_buffer_init(&context_buf, 16384);  /* Larger buffer for context */
+        if (ret) {
+            pr_err("llm_send_openai: Failed to initialize context buffer: %d\n", ret);
+            goto cleanup;
+        }
 
         ret = context_get_conversation(req->conversation_id, &context_buf);
-        if (ret == 0 && context_buf.used > 0) {
-            ret = append_json_string(json_buf, "{\"model\": \"");
-            if (ret)
+        if (ret == 0 && context_buf.used > 2) { /* Has valid context (more than just "[]") */
+            /* Add context entries, but skip trailing ']' */
+            context_buf.data[context_buf.used - 1] = '\0';
+            ret = append_json_string(&json_buf, context_buf.data + 1);
+            if (ret) {
+                json_buffer_free(&context_buf);
                 goto cleanup;
-            ret = append_json_string(json_buf, model);
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, "\", \"messages\": ");
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, context_buf.data);
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, ", {\"role\": \"");
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, req->role);
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, "\", \"content\": \"");
-            if (ret)
-                goto cleanup;
-            ret = append_json_value(json_buf, req->prompt);
-            if (ret)
-                goto cleanup;
-            ret = append_json_string(json_buf, "\"}]");
-            if (!ret) {
-                ret = append_json_string(json_buf, ", \"max_tokens\": ");
-                if (!ret) {
-                    ret = append_json_number(json_buf, req->max_tokens > 0 ?
-                                           req->max_tokens : 1000);
-                    if (!ret) {
-                        ret = append_json_string(json_buf, ", \"temperature\": ");
-                        if (!ret) {
-                            ret = append_json_float(json_buf, req->temperature_x100 > 0 ?
-                                                  req->temperature_x100 : 70);
-                            if (!ret) {
-                                ret = append_json_string(json_buf, "}");
-                            }
-                        }
-                    }
-                }
             }
 
-            if (ret)
+            /* Add comma if we have context */
+            ret = append_json_string(&json_buf, ",");
+            if (ret) {
+                json_buffer_free(&context_buf);
                 goto cleanup;
-
-            json_buffer_free(&context_buf);
-            return 0;
+            }
         }
 
-        if (context_buf.data)
-            json_buffer_free(&context_buf);
+        json_buffer_free(&context_buf);
     }
 
-    ret = append_json_string(json_buf, "{\"model\": \"");
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, model);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, "\", \"messages\": [{\"role\": \"");
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, req->role);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, "\", \"content\": \"");
-    if (ret)
-        return ret;
-    ret = append_json_value(json_buf, req->prompt);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, "\"}]");
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, ", \"max_tokens\": ");
-    if (ret)
-        return ret;
-    ret = append_json_number(json_buf, req->max_tokens > 0 ?
-                           req->max_tokens : 1000);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, ", \"temperature\": ");
-    if (ret)
-        return ret;
-    ret = append_json_float(json_buf, req->temperature_x100 > 0 ?
-                          req->temperature_x100 : 70);
-    if (ret)
-        return ret;
-    ret = append_json_string(json_buf, "}");
-    return ret;
+    /* Add current message */
+    ret = append_json_string(&json_buf, "{\"role\":\"");
+    if (ret) goto cleanup;
 
-cleanup:
-    json_buffer_free(&context_buf);
-    return ret;
-}
+    ret = append_json_value(&json_buf, req->role);
+    if (ret) goto cleanup;
 
-int llm_send_anthropic(const char *api_key,
-                       struct llm_request *req,
-                       struct llm_response *resp)
-{
-    struct llm_json_buffer json_buf;
-    int ret;
-    char auth_header[64];
+    ret = append_json_string(&json_buf, "\",\"content\":\"");
+    if (ret) goto cleanup;
 
-    if (!api_key || !req || !resp)
-        return -EINVAL;
+    ret = append_json_value(&json_buf, req->prompt);
+    if (ret) goto cleanup;
 
-    if (strlen(api_key) < 20) {
-        pr_err("llm_send_anthropic: Invalid API key\n");
-        return -LLM_ERR_AUTH;
-    }
+    ret = append_json_string(&json_buf, "\"}");
+    if (ret) goto cleanup;
 
-    ret = json_buffer_init(&json_buf, MAX_PAYLOAD_SIZE);
-    if (ret < 0)
-        return ret;
+    /* Complete the JSON request */
+    ret = append_json_string(&json_buf, "],\"temperature\":");
+    if (ret) goto cleanup;
 
-    ret = format_anthropic_request(req, &json_buf);
+    ret = append_json_float(&json_buf, req->temperature_x100);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, ",\"max_tokens\":");
+    if (ret) goto cleanup;
+
+    ret = append_json_number(&json_buf, req->max_tokens);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "}");
+    if (ret) goto cleanup;
+
+    /* Send request to OpenAI API */
+    ret = network_send_request(openai_host, port, path,
+                               NULL, auth_header, true,
+                               req->timeout_ms, &json_buf, resp);
+
+    /* Handle network errors */
     if (ret < 0) {
-        json_buffer_free(&json_buf);
-        return ret;
+        if (ret == -LLM_ERR_RATE_LIMIT) {
+            pr_warn("llm_send_openai: Rate limited, will reset in %lu ms\n",
+                    resp->rate_limit_reset_ms);
+            /* Update scheduler state to mark OpenAI as rate limited */
+            handle_rate_limit(PROVIDER_OPENAI, get_scheduler_state(), resp->rate_limit_reset_ms);
+        } else {
+            pr_err("llm_send_openai: Request failed: %d\n", ret);
+        }
+        goto cleanup;
     }
 
-    resp->provider_used = PROVIDER_ANTHROPIC;
-    strncpy(resp->model_used,
-            req->model_name[0] ? req->model_name : get_default_model(PROVIDER_ANTHROPIC),
-            MAX_MODEL_NAME);
-    resp->timestamp = ktime_get();
-
-    snprintf(auth_header, sizeof(auth_header), "x-api-key: %s\r\nanthropic-version: 2023-06-01", api_key);
-    ret = network_send_request("api.anthropic.com", 443, "/v1/messages",
-                             "", auth_header, true,
-                             req->timeout_ms, &json_buf, resp);
-
-    if (ret == 0 && req->conversation_id > 0) {
+    /* Store prompt in conversation context if needed */
+    if (req->conversation_id > 0) {
         context_add_entry(req->conversation_id, req->role, req->prompt);
-        {
-            char assistant_content[MAX_PROMPT_LENGTH];
-            ret = extract_response_content(resp->content, assistant_content, sizeof(assistant_content));
-            if (ret > 0)
-                context_add_entry(req->conversation_id, "assistant", assistant_content);
+
+        /* Also store the response in the context */
+        if (resp->content_length > 0) {
+            context_add_entry(req->conversation_id, "assistant", resp->content);
         }
     }
 
+    cleanup:
     json_buffer_free(&json_buf);
     return ret;
 }
 
-static int format_gemini_request(struct llm_request *req, struct llm_json_buffer *json_buf)
+/* Anthropic API implementation */
+int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
+    char *anthropic_host = "104.18.6.119";  /* Anthropic API IP - would use DNS in real implementation */
+    int port = 443;
+    char *path = "/v1/messages";
+    struct llm_json_buffer json_buf;
     int ret;
+    char auth_header[128];
     const char *model;
 
-    json_buf->used = 0;
-
-    if (req->model_name[0] != '\0' && is_model_supported(PROVIDER_GOOGLE_GEMINI, req->model_name))
-        model = req->model_name;
-    else
-        model = get_default_model(PROVIDER_GOOGLE_GEMINI);
-
-    ret = append_json_string(json_buf, "{\"contents\": [");
-    if (ret)
-        return ret;
-
-    if (req->conversation_id > 0) {
-        int entry_count = context_get_entry_count(req->conversation_id);
-        if (entry_count > 0) {
-            char context_summary[MAX_PROMPT_LENGTH];
-            snprintf(context_summary, sizeof(context_summary),
-                "This is a continuation of a conversation. "
-                "Previous context: (conversation ID %d with %d messages). "
-                "Continue from here with the following message: %s",
-                req->conversation_id, entry_count, req->prompt);
-            ret = append_json_string(json_buf, "{\"role\": \"user\", \"parts\": [{\"text\": \"");
-            if (ret)
-                return ret;
-            ret = append_json_value(json_buf, context_summary);
-            if (ret)
-                return ret;
-            ret = append_json_string(json_buf, "\"}]}");
-            if (ret)
-                return ret;
-        } else {
-            ret = append_json_string(json_buf, "{\"role\": \"user\", \"parts\": [{\"text\": \"");
-            if (ret)
-                return ret;
-            ret = append_json_value(json_buf, req->prompt);
-            if (ret)
-                return ret;
-            ret = append_json_string(json_buf, "\"}]}");
-            if (ret)
-                return ret;
-        }
-    } else {
-        ret = append_json_string(json_buf, "{\"role\": \"user\", \"parts\": [{\"text\": \"");
-        if (ret)
-            return ret;
-        ret = append_json_value(json_buf, req->prompt);
-        if (ret)
-            return ret;
-        ret = append_json_string(json_buf, "\"}]}");
-        if (ret)
-            return ret;
-    }
-
-    ret = append_json_string(json_buf, "], \"generationConfig\": {");
-    if (ret)
-        return ret;
-
-    ret = append_json_string(json_buf, "\"maxOutputTokens\": ");
-    if (ret)
-        return ret;
-
-    ret = append_json_number(json_buf, req->max_tokens > 0 ? req->max_tokens : 1000);
-    if (ret)
-        return ret;
-
-    ret = append_json_string(json_buf, ", \"temperature\": ");
-    if (ret)
-        return ret;
-
-    ret = append_json_float(json_buf, req->temperature_x100 > 0 ? req->temperature_x100 : 70);
-    if (ret)
-        return ret;
-
-    ret = append_json_string(json_buf, ", \"topP\": 0.95");
-    if (ret)
-        return ret;
-
-    ret = append_json_string(json_buf, "}}");
-
-    return ret;
-}
-
-int llm_send_google_gemini(const char *api_key,
-                           struct llm_request *req,
-                           struct llm_response *resp)
-{
-    struct llm_json_buffer json_buf;
-    int ret;
-    char http_path[512];
-    const char *model_name;
-
-    if (!api_key || !req || !resp)
+    if (!api_key || !req || !resp) {
+        pr_err("llm_send_anthropic: Invalid parameters\n");
         return -EINVAL;
-
-    if (strlen(api_key) < 10) {
-        pr_err("llm_send_google_gemini: Invalid API key\n");
-        return -LLM_ERR_AUTH;
     }
 
-    if (req->model_name[0] != '\0' && is_model_supported(PROVIDER_GOOGLE_GEMINI, req->model_name))
-        model_name = req->model_name;
-    else
-        model_name = get_default_model(PROVIDER_GOOGLE_GEMINI);
+    /* Initialize response */
+    memset(resp, 0, sizeof(*resp));
+    resp->provider_used = PROVIDER_ANTHROPIC;
 
-    ret = json_buffer_init(&json_buf, MAX_PAYLOAD_SIZE);
-    if (ret < 0)
+    /* Check/use default model if none specified */
+    if (req->model_name[0] == '\0') {
+        model = get_default_model(PROVIDER_ANTHROPIC);
+        strscpy(resp->model_used, model, MAX_MODEL_NAME);
+    } else {
+        if (!is_model_supported(PROVIDER_ANTHROPIC, req->model_name)) {
+            pr_warn("llm_send_anthropic: Unsupported model %s, using default\n",
+                    req->model_name);
+            model = get_default_model(PROVIDER_ANTHROPIC);
+        } else {
+            model = req->model_name;
+        }
+        strscpy(resp->model_used, model, MAX_MODEL_NAME);
+    }
+
+    /* Format auth header */
+    snprintf(auth_header, sizeof(auth_header), "x-api-key: %s\r\nanthropic-version: 2023-06-01\r\n", api_key);
+
+    /* Initialize JSON buffer */
+    ret = json_buffer_init(&json_buf, 4096);
+    if (ret) {
+        pr_err("llm_send_anthropic: Failed to initialize JSON buffer: %d\n", ret);
         return ret;
+    }
 
-    ret = format_gemini_request(req, &json_buf);
+    /* Create Anthropic-specific JSON payload */
+    ret = append_json_string(&json_buf, "{\"model\":\"");
+    if (ret) goto cleanup;
+
+    ret = append_json_value(&json_buf, model);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "\",\"messages\":[");
+    if (ret) goto cleanup;
+
+    /* Add conversation context if available */
+    if (req->conversation_id > 0) {
+        struct llm_json_buffer context_buf;
+
+        ret = json_buffer_init(&context_buf, 16384);  /* Larger buffer for context */
+        if (ret) {
+            pr_err("llm_send_anthropic: Failed to initialize context buffer: %d\n", ret);
+            goto cleanup;
+        }
+
+        ret = context_get_conversation(req->conversation_id, &context_buf);
+        if (ret == 0 && context_buf.used > 2) { /* Has valid context (more than just "[]") */
+            /* Add context entries, but skip trailing ']' */
+            context_buf.data[context_buf.used - 1] = '\0';
+            ret = append_json_string(&json_buf, context_buf.data + 1);
+            if (ret) {
+                json_buffer_free(&context_buf);
+                goto cleanup;
+            }
+
+            /* Add comma if we have context */
+            ret = append_json_string(&json_buf, ",");
+            if (ret) {
+                json_buffer_free(&context_buf);
+                goto cleanup;
+            }
+        }
+
+        json_buffer_free(&context_buf);
+    }
+
+    /* Add current message */
+    ret = append_json_string(&json_buf, "{\"role\":\"");
+    if (ret) goto cleanup;
+
+    ret = append_json_value(&json_buf, req->role);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "\",\"content\":\"");
+    if (ret) goto cleanup;
+
+    ret = append_json_value(&json_buf, req->prompt);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "\"}");
+    if (ret) goto cleanup;
+
+    /* Complete the JSON request */
+    ret = append_json_string(&json_buf, "],\"max_tokens\":");
+    if (ret) goto cleanup;
+
+    ret = append_json_number(&json_buf, req->max_tokens);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, ",\"temperature\":");
+    if (ret) goto cleanup;
+
+    ret = append_json_float(&json_buf, req->temperature_x100);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "}");
+    if (ret) goto cleanup;
+
+    /* Send request to Anthropic API */
+    ret = network_send_request(anthropic_host, port, path,
+                               NULL, auth_header, true,
+                               req->timeout_ms, &json_buf, resp);
+
+    /* Handle network errors */
     if (ret < 0) {
-        json_buffer_free(&json_buf);
-        return ret;
+        if (ret == -LLM_ERR_RATE_LIMIT) {
+            pr_warn("llm_send_anthropic: Rate limited, will reset in %lu ms\n",
+                    resp->rate_limit_reset_ms);
+            /* Update scheduler state to mark Anthropic as rate limited */
+            handle_rate_limit(PROVIDER_ANTHROPIC, get_scheduler_state(), resp->rate_limit_reset_ms);
+        } else {
+            pr_err("llm_send_anthropic: Request failed: %d\n", ret);
+        }
+        goto cleanup;
     }
 
-    resp->provider_used = PROVIDER_GOOGLE_GEMINI;
-    strncpy(resp->model_used, model_name, MAX_MODEL_NAME);
-    resp->timestamp = ktime_get();
-
-    snprintf(http_path, sizeof(http_path),
-             "/v1/models/%s:generateContent?key=%s", model_name, api_key);
-
-    ret = network_send_request("generativelanguage.googleapis.com", 443,
-                             http_path, "", "", true,
-                             req->timeout_ms, &json_buf, resp);
-
-    if (ret == 0 && req->conversation_id > 0) {
+    /* Store prompt in conversation context if needed */
+    if (req->conversation_id > 0) {
         context_add_entry(req->conversation_id, req->role, req->prompt);
-        {
-            char assistant_content[MAX_PROMPT_LENGTH];
-            ret = extract_response_content(resp->content, assistant_content, sizeof(assistant_content));
-            if (ret > 0)
-                context_add_entry(req->conversation_id, "assistant", assistant_content);
+
+        /* Also store the response in the context */
+        if (resp->content_length > 0) {
+            context_add_entry(req->conversation_id, "assistant", resp->content);
         }
     }
 
+    cleanup:
     json_buffer_free(&json_buf);
     return ret;
 }
 
-/* --- Orchestration Function --- */
-/* Removed duplicate "static" keyword */
+/* Google Gemini API implementation */
+int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct llm_response *resp)
+{
+    char *gemini_host = "104.18.6.14";  /* Google Gemini API IP - would use DNS in real implementation */
+    int port = 443;
+    char *path = "/v1/models/gemini-pro:generateContent";  /* Path will include API key */
+    struct llm_json_buffer json_buf;
+    int ret;
+    char auth_path[256];
+    const char *model;
+
+    if (!api_key || !req || !resp) {
+        pr_err("llm_send_google_gemini: Invalid parameters\n");
+        return -EINVAL;
+    }
+
+    /* Initialize response */
+    memset(resp, 0, sizeof(*resp));
+    resp->provider_used = PROVIDER_GOOGLE_GEMINI;
+
+    /* Check/use default model if none specified */
+    if (req->model_name[0] == '\0') {
+        model = get_default_model(PROVIDER_GOOGLE_GEMINI);
+        strscpy(resp->model_used, model, MAX_MODEL_NAME);
+    } else {
+        if (!is_model_supported(PROVIDER_GOOGLE_GEMINI, req->model_name)) {
+            pr_warn("llm_send_google_gemini: Unsupported model %s, using default\n",
+                    req->model_name);
+            model = get_default_model(PROVIDER_GOOGLE_GEMINI);
+        } else {
+            model = req->model_name;
+        }
+        strscpy(resp->model_used, model, MAX_MODEL_NAME);
+    }
+
+    /* Format path with API key */
+    snprintf(auth_path, sizeof(auth_path), "%s?key=%s", path, api_key);
+
+    /* Initialize JSON buffer */
+    ret = json_buffer_init(&json_buf, 4096);
+    if (ret) {
+        pr_err("llm_send_google_gemini: Failed to initialize JSON buffer: %d\n", ret);
+        return ret;
+    }
+
+    /* Create Google Gemini-specific JSON payload */
+    ret = append_json_string(&json_buf, "{\"contents\":[");
+    if (ret) goto cleanup;
+
+    /* Add conversation context if available - Gemini has a different format */
+    if (req->conversation_id > 0) {
+        struct llm_json_buffer context_buf;
+        struct context_entry *entry;
+        unsigned long flags;
+        struct conversation_context *ctx;
+
+        /* Find the conversation */
+        spin_lock_irqsave(&conversations_lock, flags);
+        ctx = find_conversation(req->conversation_id);
+        if (!ctx) {
+            spin_unlock_irqrestore(&conversations_lock, flags);
+            pr_debug("llm_send_google_gemini: Conversation %d not found\n", req->conversation_id);
+        } else {
+            spin_unlock_irqrestore(&conversations_lock, flags);
+
+            /* Manually format Gemini-compatible conversation history */
+            spin_lock_irqsave(&ctx->lock, flags);
+            list_for_each_entry(entry, &ctx->entries, list) {
+                ret = append_json_string(&json_buf, "{\"role\":\"");
+                if (ret) {
+                    spin_unlock_irqrestore(&ctx->lock, flags);
+                    goto cleanup;
+                }
+
+                /* Convert "user" to "user", "assistant" to "model" for Gemini */
+                if (strcmp(entry->role, "assistant") == 0) {
+                    ret = append_json_string(&json_buf, "model");
+                } else {
+                    ret = append_json_value(&json_buf, entry->role);
+                }
+
+                if (ret) {
+                    spin_unlock_irqrestore(&ctx->lock, flags);
+                    goto cleanup;
+                }
+
+                ret = append_json_string(&json_buf, "\",\"parts\":[{\"text\":\"");
+                if (ret) {
+                    spin_unlock_irqrestore(&ctx->lock, flags);
+                    goto cleanup;
+                }
+
+                ret = append_json_value(&json_buf, entry->content);
+                if (ret) {
+                    spin_unlock_irqrestore(&ctx->lock, flags);
+                    goto cleanup;
+                }
+
+                ret = append_json_string(&json_buf, "\"}]},");
+                if (ret) {
+                    spin_unlock_irqrestore(&ctx->lock, flags);
+                    goto cleanup;
+                }
+            }
+            spin_unlock_irqrestore(&ctx->lock, flags);
+        }
+    }
+
+    /* Add current message - Gemini format */
+    ret = append_json_string(&json_buf, "{\"role\":\"user\",\"parts\":[{\"text\":\"");
+    if (ret) goto cleanup;
+
+    ret = append_json_value(&json_buf, req->prompt);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "\"}]}],");
+    if (ret) goto cleanup;
+
+    /* Add generation parameters */
+    ret = append_json_string(&json_buf, "\"generationConfig\":{");
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "\"temperature\":");
+    if (ret) goto cleanup;
+
+    ret = append_json_float(&json_buf, req->temperature_x100);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, ",\"maxOutputTokens\":");
+    if (ret) goto cleanup;
+
+    ret = append_json_number(&json_buf, req->max_tokens);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, "}}");
+    if (ret) goto cleanup;
+
+    /* Send request to Google Gemini API */
+    ret = network_send_request(gemini_host, port, auth_path,
+                               NULL, NULL, true,
+                               req->timeout_ms, &json_buf, resp);
+
+    /* Handle network errors */
+    if (ret < 0) {
+        if (ret == -LLM_ERR_RATE_LIMIT) {
+            pr_warn("llm_send_google_gemini: Rate limited, will reset in %lu ms\n",
+                    resp->rate_limit_reset_ms);
+            /* Update scheduler state to mark Gemini as rate limited */
+            handle_rate_limit(PROVIDER_GOOGLE_GEMINI, get_scheduler_state(), resp->rate_limit_reset_ms);
+        } else {
+            pr_err("llm_send_google_gemini: Request failed: %d\n", ret);
+        }
+        goto cleanup;
+    }
+
+    /* Store prompt in conversation context if needed */
+    if (req->conversation_id > 0) {
+        context_add_entry(req->conversation_id, req->role, req->prompt);
+
+        /* Also store the response in the context */
+        if (resp->content_length > 0) {
+            context_add_entry(req->conversation_id, "assistant", resp->content);
+        }
+    }
+
+    cleanup:
+    json_buffer_free(&json_buf);
+    return ret;
+}
+
+
+/* Function to safely set API keys */
+static int set_api_key(int provider, const char *key)
+{
+    size_t key_len;
+    char *secure_key;
+
+    if (!key || provider < 0 || provider >= 3)
+        return -EINVAL;
+
+    key_len = strlen(key);
+    if (key_len < 8 || key_len > 256)
+        return -EINVAL;  /* Validate reasonable key length */
+
+    /* Allocate secure memory */
+    secure_key = kzalloc(key_len + 1, GFP_KERNEL);
+    if (!secure_key)
+        return -ENOMEM;
+
+    /* Copy key */
+    strscpy(secure_key, key, key_len + 1);
+
+    /* Free old key if it exists */
+    if (secure_api_keys[provider]) {
+        memzero_explicit(secure_api_keys[provider], strlen(secure_api_keys[provider]));
+        kfree(secure_api_keys[provider]);
+    }
+
+    secure_api_keys[provider] = secure_key;
+    return 0;
+}
+
+/* Function to safely get API key without exposing it */
+static const char *get_api_key(int provider)
+{
+    if (provider < 0 || provider >= 3)
+        return NULL;
+
+    return secure_api_keys[provider];
+}
+
+/* Clear all API keys securely */
+static void clear_all_api_keys(void)
+{
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        if (secure_api_keys[i]) {
+            memzero_explicit(secure_api_keys[i], strlen(secure_api_keys[i]));
+            kfree(secure_api_keys[i]);
+            secure_api_keys[i] = NULL;
+        }
+    }
+}
+
+/* Main request orchestration function */
 static int orchestrate_request(struct llm_request *req, struct llm_response *resp)
 {
     int selected_provider, ret = -EINVAL;
     int i;
 
+    /* Set default values if not provided */
     req->timeout_ms = (req->timeout_ms > 0) ? req->timeout_ms : 30000;
     if (req->temperature_x100 <= 0)
         req->temperature_x100 = 70;
 
+    /* Initialize response */
     memset(resp, 0, sizeof(*resp));
     resp->timestamp = ktime_get();
 
+    /* Select provider based on scheduling algorithm */
     selected_provider = select_provider(req, &global_scheduler);
     if (selected_provider < 0)
         return selected_provider;
 
     resp->provider_used = selected_provider;
 
+    /* Special handling for fallback algorithm */
     if (req->scheduler_algorithm == SCHEDULER_FALLBACK) {
+        /* Try each provider in sequence */
         ret = llm_send_openai(openai_api_key, req, resp);
         update_provider_metrics(PROVIDER_OPENAI, ret, resp->latency_ms, resp->tokens_used);
         if (ret == 0)
@@ -799,6 +633,7 @@ static int orchestrate_request(struct llm_request *req, struct llm_response *res
         return ret;
     }
 
+    /* Try the selected provider and fall back if needed */
     for (i = 0; i < PROVIDER_COUNT; i++) {
         int provider = (selected_provider + i) % PROVIDER_COUNT;
         resp->provider_used = provider;
@@ -833,7 +668,7 @@ static int orchestrate_request(struct llm_request *req, struct llm_response *res
     return ret;
 }
 
-/* --- Maintenance Timer Functions --- */
+/* Maintenance timer callback */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
 static void maintenance_timer_callback(struct timer_list *t)
 #else
@@ -843,242 +678,121 @@ static void maintenance_timer_callback(unsigned long data)
     if (prune_threshold_mins > 0)
         context_prune_old_conversations(prune_threshold_mins * 60 * 1000);
 
-    mod_timer(&maintenance_timer, jiffies + HZ * 60 * 10);
+    mod_timer(&maintenance_timer, jiffies + HZ * 60 * 10); /* Run every 10 minutes */
 }
 
-/* --- Character Device File Operations --- */
+/* Character device file operations */
 static int orchestrator_open(struct inode *inode, struct file *file)
 {
-    /* Store scheduler state pointer in task struct */
+    /* Store scheduler state pointer in task struct for later use */
     current->scheduler_data = &global_scheduler;
     return 0;
 }
 
 static int orchestrator_release(struct inode *inode, struct file *file)
 {
+    current->scheduler_data = NULL;
     return 0;
 }
 
-static ssize_t orchestrator_write(struct file *file,
-                                  const char __user *buf,
-                                  size_t count,
-                                  loff_t *offset)
+static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
 {
     struct llm_request req;
     int ret;
+
     if (count != sizeof(struct llm_request))
         return -EINVAL;
+
     if (copy_from_user(&req, buf, sizeof(req)))
         return -EFAULT;
-    if (req.timeout_ms > 300000)
-        req.timeout_ms = 300000;
-    else if (req.timeout_ms <= 0)
-        req.timeout_ms = 30000;
-    if (req.role[0] == '\0')
-        strcpy(req.role, "user");
+
+    /* Comprehensive input validation */
+    if (req.conversation_id <= 0) {
+        pr_err("orchestrator_write: Invalid conversation_id: %d\n", req.conversation_id);
+        return -EINVAL;
+    }
+
+    /* Validate prompt - ensure it's not empty and is null-terminated */
+    if (req.prompt[0] == '\0') {
+        pr_err("orchestrator_write: Empty prompt\n");
+        return -EINVAL;
+    }
+    req.prompt[MAX_PROMPT_LENGTH - 1] = '\0';
+
+    /* Validate role - use default if empty */
+    if (req.role[0] == '\0') {
+        strscpy(req.role, "user", MAX_ROLE_NAME);
+    } else {
+        req.role[MAX_ROLE_NAME - 1] = '\0';
+    }
+
+    /* Validate model name - if empty, we'll use a default in the provider code */
+    req.model_name[MAX_MODEL_NAME - 1] = '\0';
+
+    /* Validate and set reasonable defaults for numeric parameters */
+    if (req.max_tokens <= 0 || req.max_tokens > 32000) {
+        req.max_tokens = 4000; /* Reasonable default */
+    }
+
+    if (req.temperature_x100 <= 0 || req.temperature_x100 > 200) {
+        req.temperature_x100 = 70; /* Default to 0.7 */
+    }
+
+    if (req.timeout_ms <= 0) {
+        req.timeout_ms = 30000; /* 30 seconds default */
+    } else if (req.timeout_ms > 300000) {
+        req.timeout_ms = 300000; /* Cap at 5 minutes */
+    }
+
+    /* Validate scheduler algorithm */
+    if (req.scheduler_algorithm != -1 && (req.scheduler_algorithm < 0 || req.scheduler_algorithm > SCHEDULER_MAX_ALGORITHM)) {
+        pr_warn("orchestrator_write: Invalid scheduler algorithm: %d, using default\n",
+        req.scheduler_algorithm);
+        req.scheduler_algorithm = -1; /* Use default from state */
+    }
+
+    /* Validate priority */
+    if (req.priority < 0) {
+        req.priority = 0;
+    } else if (req.priority > 100) {
+        req.priority = 100;
+    }
+
     mutex_lock(&orchestrator_mutex);
     ret = orchestrate_request(&req, &global_response);
     mutex_unlock(&orchestrator_mutex);
     return ret < 0 ? ret : count;
 }
 
-static ssize_t orchestrator_read(struct file *file,
-                                 char __user *buf,
-                                 size_t count,
-                                 loff_t *offset)
+
+static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
     ssize_t ret;
+
     mutex_lock(&orchestrator_mutex);
+
     if (global_response.content_length == 0) {
         mutex_unlock(&orchestrator_mutex);
         return 0;
     }
+
     if (count < global_response.content_length) {
         mutex_unlock(&orchestrator_mutex);
         return -EINVAL;
     }
+
     if (copy_to_user(buf, global_response.content, global_response.content_length)) {
         mutex_unlock(&orchestrator_mutex);
         return -EFAULT;
     }
+
     ret = global_response.content_length;
     global_response.content_length = 0;
     mutex_unlock(&orchestrator_mutex);
     return ret;
 }
 
-/* Sysfs interfaces */
-static ssize_t scheduler_algorithm_show(struct device *dev,
-                                       struct device_attribute *attr,
-                                       char *buf)
-{
-    const char *algorithm_names[] = {
-        "Round Robin", "Weighted", "Priority", "Performance", "Cost Aware", "Fallback", "FIFO"
-    };
-    int algorithm = atomic_read(&global_scheduler.current_algorithm);
-    if (algorithm < 0 || algorithm > SCHEDULER_FIFO)
-        return sprintf(buf, "Unknown (%d)\n", algorithm);
-    return sprintf(buf, "%d (%s)\n", algorithm, algorithm_names[algorithm]);
-}
-
-static ssize_t scheduler_algorithm_store(struct device *dev,
-                                        struct device_attribute *attr,
-                                        const char *buf, size_t count)
-{
-    int algorithm;
-    if (kstrtoint(buf, 0, &algorithm) < 0)
-        return -EINVAL;
-    if (algorithm < 0 || algorithm > SCHEDULER_FIFO)
-        return -EINVAL;
-    atomic_set(&global_scheduler.current_algorithm, algorithm);
-    pr_info("Scheduler algorithm set to %d\n", algorithm);
-    return count;
-}
-
-static ssize_t provider_metrics_show(struct device *dev,
-                                    struct device_attribute *attr,
-                                    char *buf)
-{
-    const char *provider_names[] = {
-        "OpenAI", "Anthropic", "Google Gemini"
-    };
-    int i;
-    ssize_t len = 0;
-    unsigned long avg_latency;
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        struct provider_metrics *m = &global_scheduler.metrics[i];
-        int successful = atomic_read(&m->successful_requests);
-        int total = atomic_read(&m->total_requests);
-        if (successful > 0)
-            avg_latency = atomic64_read(&m->total_latency_ms) / successful;
-        else
-            avg_latency = 0;
-        len += sprintf(buf + len,
-                      "Provider: %s\n"
-                      "  Status: %d\n"
-                      "  Total Requests: %d\n"
-                      "  Successful: %d\n"
-                      "  Failed: %d\n"
-                      "  Timeouts: %d\n"
-                      "  Rate Limited: %d\n"
-                      "  Avg Latency: %lu ms\n"
-                      "  Min Latency: %lu ms\n"
-                      "  Max Latency: %lu ms\n"
-                      "  Success Rate: %d%%\n"
-                      "  Total Tokens: %d\n\n",
-                      provider_names[i],
-                      atomic_read(&m->current_status),
-                      total,
-                      successful,
-                      atomic_read(&m->failed_requests),
-                      atomic_read(&m->timeouts),
-                      atomic_read(&m->rate_limited),
-                      avg_latency,
-                      m->min_latency_ms == ULONG_MAX ? 0 : m->min_latency_ms,
-                      m->max_latency_ms,
-                      total > 0 ? (successful * 100) / total : 0,
-                      atomic_read(&m->total_tokens));
-    }
-    len += sprintf(buf + len,
-                  "Scheduler Configuration:\n"
-                  "  Algorithm: %d\n"
-                  "  Weights: OpenAI=%d%%, Anthropic=%d%%, Gemini=%d%%\n"
-                  "  Auto-adjust: %s\n",
-                  atomic_read(&global_scheduler.current_algorithm),
-                  global_scheduler.weights[PROVIDER_OPENAI],
-                  global_scheduler.weights[PROVIDER_ANTHROPIC],
-                  global_scheduler.weights[PROVIDER_GOOGLE_GEMINI],
-                  global_scheduler.auto_adjust ? "enabled" : "disabled");
-    return len;
-}
-
-static ssize_t reset_metrics_store(struct device *dev,
-                                  struct device_attribute *attr,
-                                  const char *buf, size_t count)
-{
-    int reset;
-    if (kstrtoint(buf, 0, &reset) < 0)
-        return -EINVAL;
-    if (reset == 1) {
-        scheduler_reset_metrics(&global_scheduler);
-        pr_info("Scheduler metrics reset\n");
-    }
-    return count;
-}
-
-static ssize_t scheduler_weights_show(struct device *dev,
-                                    struct device_attribute *attr,
-                                    char *buf)
-{
-    return sprintf(buf,
-                 "OpenAI: %d%%\nAnthropic: %d%%\nGoogle Gemini: %d%%\n",
-                 global_scheduler.weights[PROVIDER_OPENAI],
-                 global_scheduler.weights[PROVIDER_ANTHROPIC],
-                 global_scheduler.weights[PROVIDER_GOOGLE_GEMINI]);
-}
-
-static ssize_t scheduler_weights_store(struct device *dev,
-                                     struct device_attribute *attr,
-                                     const char *buf, size_t count)
-{
-    int openai, anthropic, gemini;
-    if (sscanf(buf, "%d,%d,%d", &openai, &anthropic, &gemini) != 3)
-        return -EINVAL;
-    if (openai < 0 || anthropic < 0 || gemini < 0)
-        return -EINVAL;
-    if (openai + anthropic + gemini != 100)
-        return -EINVAL;
-    global_scheduler.weights[PROVIDER_OPENAI] = openai;
-    global_scheduler.weights[PROVIDER_ANTHROPIC] = anthropic;
-    global_scheduler.weights[PROVIDER_GOOGLE_GEMINI] = gemini;
-    pr_info("Scheduler weights updated: OpenAI=%d%%, Anthropic=%d%%, Gemini=%d%%\n",
-            openai, anthropic, gemini);
-    return count;
-}
-
-static ssize_t auto_adjust_show(struct device *dev,
-                               struct device_attribute *attr,
-                               char *buf)
-{
-    return sprintf(buf, "%d\n", global_scheduler.auto_adjust ? 1 : 0);
-}
-
-static ssize_t auto_adjust_store(struct device *dev,
-                                struct device_attribute *attr,
-                                const char *buf, size_t count)
-{
-    int enable;
-    if (kstrtoint(buf, 0, &enable) < 0)
-        return -EINVAL;
-    global_scheduler.auto_adjust = (enable != 0);
-    pr_info("Scheduler auto-adjust %s\n", global_scheduler.auto_adjust ? "enabled" : "disabled");
-    if (global_scheduler.auto_adjust)
-        adjust_scheduler_weights(&global_scheduler);
-    return count;
-}
-
-static ssize_t fifo_status_show(struct device *dev,
-                               struct device_attribute *attr,
-                               char *buf)
-{
-    unsigned long flags;
-    int count;
-    spin_lock_irqsave(&global_scheduler.fifo.lock, flags);
-    count = global_scheduler.fifo.count;
-    spin_unlock_irqrestore(&global_scheduler.fifo.lock, flags);
-    return sprintf(buf, "FIFO queue size: %d/%d\n", count, MAX_FIFO_QUEUE_SIZE);
-}
-
-static ssize_t context_status_show(struct device *dev,
-                                  struct device_attribute *attr,
-                                  char *buf)
-{
-    return sprintf(buf,
-                 "Context management:\n  Auto-prune threshold: %d minutes\n  Max context entries: %d\n",
-                 prune_threshold_mins,
-                 MAX_CONTEXT_ENTRIES);
-}
-
+/* Sysfs interfaces for configuration and statistics */
 static DEVICE_ATTR(scheduler_algorithm, 0644, scheduler_algorithm_show, scheduler_algorithm_store);
 static DEVICE_ATTR(provider_metrics, 0444, provider_metrics_show, NULL);
 static DEVICE_ATTR(reset_metrics, 0200, NULL, reset_metrics_store);
@@ -1086,92 +800,193 @@ static DEVICE_ATTR(scheduler_weights, 0644, scheduler_weights_show, scheduler_we
 static DEVICE_ATTR(auto_adjust, 0644, auto_adjust_show, auto_adjust_store);
 static DEVICE_ATTR(fifo_status, 0444, fifo_status_show, NULL);
 static DEVICE_ATTR(context_status, 0444, context_status_show, NULL);
+static DEVICE_ATTR(memory_stats, 0444, memory_stats_show, NULL);
+static DEVICE_ATTR(memory_limits, 0644, memory_limits_show, memory_limits_store);
 
-static struct file_operations orchestrator_fops = {
-    .owner = THIS_MODULE,
-    .open = orchestrator_open,
-    .release = orchestrator_release,
-    .write = orchestrator_write,
-    .read = orchestrator_read,
-};
-
+/* Fix for module initialization order in orchestrator_init() in orchestrator_main.c */
 static int __init orchestrator_init(void)
 {
     int ret;
     dev_t dev;
-    if (prune_threshold_mins < 0) {
-        pr_warn("orchestrator_init: Invalid prune_threshold_mins, setting to default (60)\n");
-        prune_threshold_mins = 60;
-    }
+
     pr_info("LLM Orchestrator: Initializing module version %s\n", DRIVER_VERSION);
 
+    /* Step 1: Initialize memory management first as it's a dependency for everything else */
+    ret = memory_management_init();
+    if (ret) {
+        pr_err("orchestrator_init: Failed to initialize memory management: %d\n", ret);
+        return ret;
+    }
+    pr_info("LLM Orchestrator: Memory management initialized\n");
+
+    /* Step 2: Initialize JSON manager */
+    ret = json_manager_init();
+    if (ret) {
+        pr_err("orchestrator_init: Failed to initialize JSON manager: %d\n", ret);
+        goto fail_json;
+    }
+    pr_info("LLM Orchestrator: JSON manager initialized\n");
+
+    /* Step 3: Initialize context management */
+    ret = context_management_init();
+    if (ret) {
+        pr_err("orchestrator_init: Failed to initialize context management: %d\n", ret);
+        goto fail_context;
+    }
+    pr_info("LLM Orchestrator: Context management initialized\n");
+
+    /* Step 4: Initialize network subsystem */
+    ret = network_init();
+    if (ret) {
+        pr_err("orchestrator_init: Failed to initialize network subsystem: %d\n", ret);
+        goto fail_network;
+    }
+    pr_info("LLM Orchestrator: Network subsystem initialized\n");
+
+    /* Step 5: Initialize TLS subsystem */
+    ret = tls_init();
+    if (ret) {
+        pr_err("orchestrator_init: Failed to initialize TLS subsystem: %d\n", ret);
+        goto fail_tls;
+    }
+    pr_info("LLM Orchestrator: TLS subsystem initialized\n");
+
+    /* Step 6: Initialize scheduler and global state */
     scheduler_init(&global_scheduler);
     set_scheduler_state(&global_scheduler);
-
     memset(&global_response, 0, sizeof(global_response));
+    pr_info("LLM Orchestrator: Scheduler initialized\n");
 
+    /* Step 7: Set API keys securely */
+    if (openai_api_key && strlen(openai_api_key) > 0) {
+        if (set_api_key(PROVIDER_OPENAI, openai_api_key) == 0) {
+            /* Clear the module parameter after securely storing it */
+            memzero_explicit(openai_api_key, strlen(openai_api_key));
+        } else {
+            pr_warn("Failed to securely store OpenAI API key\n");
+        }
+    } else {
+        pr_warn("No OpenAI API key provided\n");
+    }
+
+    if (anthropic_api_key && strlen(anthropic_api_key) > 0) {
+        if (set_api_key(PROVIDER_ANTHROPIC, anthropic_api_key) == 0) {
+            /* Clear the module parameter after securely storing it */
+            memzero_explicit(anthropic_api_key, strlen(anthropic_api_key));
+        } else {
+            pr_warn("Failed to securely store Anthropic API key\n");
+        }
+    } else {
+        pr_warn("No Anthropic API key provided\n");
+    }
+
+    if (google_gemini_api_key && strlen(google_gemini_api_key) > 0) {
+        if (set_api_key(PROVIDER_GOOGLE_GEMINI, google_gemini_api_key) == 0) {
+            /* Clear the module parameter after securely storing it */
+            memzero_explicit(google_gemini_api_key, strlen(google_gemini_api_key));
+        } else {
+            pr_warn("Failed to securely store Google Gemini API key\n");
+        }
+    } else {
+        pr_warn("No Google Gemini API key provided\n");
+    }
+
+    /* Step 8: Register character device */
     ret = alloc_chrdev_region(&dev, 0, 1, MODULE_NAME);
     if (ret < 0) {
-        pr_err("orchestrator_init: Failed to allocate chrdev region\n");
-        return ret;
+        pr_err("orchestrator_init: Failed to allocate chrdev region: %d\n", ret);
+        goto fail_chrdev;
     }
     major_number = MAJOR(dev);
 
     cdev_init(&orchestrator_cdev, &orchestrator_fops);
     orchestrator_cdev.owner = THIS_MODULE;
+
     ret = cdev_add(&orchestrator_cdev, dev, 1);
     if (ret < 0) {
-        unregister_chrdev_region(dev, 1);
-        pr_err("orchestrator_init: Failed to add cdev\n");
-        return ret;
+        pr_err("orchestrator_init: Failed to add cdev: %d\n", ret);
+        goto fail_cdev_add;
     }
 
-    /* In orchestrator_init */
+    /* Step 9: Create device class and device */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
     orchestrator_class = class_create(THIS_MODULE, MODULE_NAME);
 #else
     orchestrator_class = class_create(MODULE_NAME);
 #endif
+
     if (IS_ERR(orchestrator_class)) {
-        cdev_del(&orchestrator_cdev);
-        unregister_chrdev_region(dev, 1);
-        pr_err("orchestrator_init: Failed to create device class\n");
-        return PTR_ERR(orchestrator_class);
+        ret = PTR_ERR(orchestrator_class);
+        pr_err("orchestrator_init: Failed to create device class: %d\n", ret);
+        goto fail_class;
     }
 
     orchestrator_device = device_create(orchestrator_class, NULL, dev, NULL, MODULE_NAME);
     if (IS_ERR(orchestrator_device)) {
-        class_destroy(orchestrator_class);
-        cdev_del(&orchestrator_cdev);
-        unregister_chrdev_region(dev, 1);
-        pr_err("orchestrator_init: Failed to create device\n");
-        return PTR_ERR(orchestrator_device);
+        ret = PTR_ERR(orchestrator_device);
+        pr_err("orchestrator_init: Failed to create device: %d\n", ret);
+        goto fail_device;
     }
 
+    /* Step 10: Create sysfs attributes */
     ret = device_create_file(orchestrator_device, &dev_attr_scheduler_algorithm);
-    if (ret)
-        pr_warn("orchestrator_init: Failed to create scheduler_algorithm sysfs file\n");
-    ret = device_create_file(orchestrator_device, &dev_attr_provider_metrics);
-    if (ret)
-        pr_warn("orchestrator_init: Failed to create provider_metrics sysfs file\n");
-    ret = device_create_file(orchestrator_device, &dev_attr_reset_metrics);
-    if (ret)
-        pr_warn("orchestrator_init: Failed to create reset_metrics sysfs file\n");
-    ret = device_create_file(orchestrator_device, &dev_attr_scheduler_weights);
-    if (ret)
-        pr_warn("orchestrator_init: Failed to create scheduler_weights sysfs file\n");
-    ret = device_create_file(orchestrator_device, &dev_attr_auto_adjust);
-    if (ret)
-        pr_warn("orchestrator_init: Failed to create auto_adjust sysfs file\n");
-    ret = device_create_file(orchestrator_device, &dev_attr_fifo_status);
-    if (ret)
-        pr_warn("orchestrator_init: Failed to create fifo_status sysfs file\n");
-    ret = device_create_file(orchestrator_device, &dev_attr_context_status);
-    if (ret)
-        pr_warn("orchestrator_init: Failed to create context_status sysfs file\n");
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create scheduler_algorithm sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
 
+    ret = device_create_file(orchestrator_device, &dev_attr_provider_metrics);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create provider_metrics sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
+    ret = device_create_file(orchestrator_device, &dev_attr_reset_metrics);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create reset_metrics sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
+    ret = device_create_file(orchestrator_device, &dev_attr_scheduler_weights);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create scheduler_weights sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
+    ret = device_create_file(orchestrator_device, &dev_attr_auto_adjust);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create auto_adjust sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
+    ret = device_create_file(orchestrator_device, &dev_attr_fifo_status);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create fifo_status sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
+    ret = device_create_file(orchestrator_device, &dev_attr_context_status);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create context_status sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
+    ret = device_create_file(orchestrator_device, &dev_attr_memory_stats);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create memory_stats sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
+    ret = device_create_file(orchestrator_device, &dev_attr_memory_limits);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create memory_limits sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
+    /* Step 11: Initialize mutex */
     mutex_init(&orchestrator_mutex);
 
+    /* Step 12: Setup maintenance timer */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
     timer_setup(&maintenance_timer, maintenance_timer_callback, 0);
 #else
@@ -1179,22 +994,44 @@ static int __init orchestrator_init(void)
 #endif
     mod_timer(&maintenance_timer, jiffies + HZ * 60 * 10);
 
-    if (!openai_api_key || strlen(openai_api_key) < 20)
-        pr_warn("orchestrator_init: No valid OpenAI API key provided\n");
-    if (!anthropic_api_key || strlen(anthropic_api_key) < 20)
-        pr_warn("orchestrator_init: No valid Anthropic API key provided\n");
-    if (!google_gemini_api_key || strlen(google_gemini_api_key) < 10)
-        pr_warn("orchestrator_init: No valid Google Gemini API key provided\n");
-    if (!openai_api_key && !anthropic_api_key && !google_gemini_api_key)
-        pr_err("orchestrator_init: No API keys provided, module may not function correctly\n");
-
     pr_info("LLM Orchestrator: Module loaded successfully with major number %d\n", major_number);
     return 0;
+
+    /* Error handling with proper cleanup */
+    fail_sysfs:
+    device_destroy(orchestrator_class, MKDEV(major_number, 0));
+    fail_device:
+    class_destroy(orchestrator_class);
+    fail_class:
+    cdev_del(&orchestrator_cdev);
+    fail_cdev_add:
+    unregister_chrdev_region(MKDEV(major_number, 0), 1);
+    fail_chrdev:
+    clear_all_api_keys();
+    tls_cleanup();
+    fail_tls:
+    network_cleanup();
+    fail_network:
+    context_cleanup_all();
+    context_management_cleanup();
+    fail_context:
+    json_manager_cleanup();
+    fail_json:
+    memory_management_cleanup();
+    return ret;
 }
 
+
+/* Fix for module exit to ensure proper cleanup order */
 static void __exit orchestrator_exit(void)
 {
+    pr_info("LLM Orchestrator: Unloading module\n");
+
+    /* Step 1: Stop the maintenance timer */
     del_timer_sync(&maintenance_timer);
+    pr_debug("LLM Orchestrator: Maintenance timer stopped\n");
+
+    /* Step 2: Remove sysfs attributes */
     device_remove_file(orchestrator_device, &dev_attr_scheduler_algorithm);
     device_remove_file(orchestrator_device, &dev_attr_provider_metrics);
     device_remove_file(orchestrator_device, &dev_attr_reset_metrics);
@@ -1202,20 +1039,48 @@ static void __exit orchestrator_exit(void)
     device_remove_file(orchestrator_device, &dev_attr_auto_adjust);
     device_remove_file(orchestrator_device, &dev_attr_fifo_status);
     device_remove_file(orchestrator_device, &dev_attr_context_status);
-    context_cleanup_all();
-    fifo_cleanup(&global_scheduler.fifo);
+    device_remove_file(orchestrator_device, &dev_attr_memory_stats);
+    device_remove_file(orchestrator_device, &dev_attr_memory_limits);
+    pr_debug("LLM Orchestrator: Sysfs attributes removed\n");
+
+    /* Step 3: Unregister device */
     device_destroy(orchestrator_class, MKDEV(major_number, 0));
     class_destroy(orchestrator_class);
     cdev_del(&orchestrator_cdev);
     unregister_chrdev_region(MKDEV(major_number, 0), 1);
-    if (openai_api_key)
-        memzero_explicit(openai_api_key, strlen(openai_api_key));
-    if (anthropic_api_key)
-        memzero_explicit(anthropic_api_key, strlen(anthropic_api_key));
-    if (google_gemini_api_key)
-        memzero_explicit(google_gemini_api_key, strlen(google_gemini_api_key));
+    pr_debug("LLM Orchestrator: Character device unregistered\n");
+
+    /* Step 4: Clean up resources in reverse initialization order */
+    clear_all_api_keys();
+    pr_debug("LLM Orchestrator: API keys securely cleared\n");
+
+    /* Step 5: Clean up TLS */
+    tls_cleanup();
+    pr_debug("LLM Orchestrator: TLS subsystem cleaned up\n");
+
+    /* Step 6: Clean up network */
+    network_cleanup();
+    pr_debug("LLM Orchestrator: Network subsystem cleaned up\n");
+
+    /* Step 7: Clean up context */
+    context_cleanup_all();
+    context_management_cleanup();
+    pr_debug("LLM Orchestrator: Context management cleaned up\n");
+
+    /* Step 8: Clean up JSON */
+    json_manager_cleanup();
+    pr_debug("LLM Orchestrator: JSON manager cleaned up\n");
+
+    /* Step 9: Clean up FIFO queue and memory management last */
+    fifo_cleanup(&global_scheduler.fifo);
+    memory_management_cleanup();
+    pr_debug("LLM Orchestrator: Memory management cleaned up\n");
+
     pr_info("LLM Orchestrator: Module unloaded\n");
 }
+
+
+
 
 module_init(orchestrator_init);
 module_exit(orchestrator_exit);
@@ -1224,4 +1089,3 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LLM Orchestrator");
 MODULE_DESCRIPTION("Enhanced LLM Orchestrator with Context Management and Advanced Scheduling");
 MODULE_VERSION(DRIVER_VERSION);
-

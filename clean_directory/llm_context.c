@@ -4,68 +4,116 @@
 #include <linux/string.h>
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
-#include "llm_orchestrator.h"
+#include <linux/ratelimit.h>
+#include "orchestrator_main.h"
+
+/*
+ * Locking hierarchy:
+ * 1. conversations_lock (global)
+ * 2. ctx->lock (per-conversation)
+ * Always acquire locks in this order to prevent deadlocks.
+ */
+
+/* Statistics for monitoring */
+static atomic_t entries_added = ATOMIC_INIT(0);
+static atomic_t conversations_created = ATOMIC_INIT(0);
+static atomic_t entries_pruned = ATOMIC_INIT(0);
+static atomic_t json_generated = ATOMIC_INIT(0);
+
+/* Rate limiting for debug logs */
+static DEFINE_RATELIMIT_STATE(ratelimit_state, 5 * HZ, 10);
 
 /* Global list of conversation contexts */
 static LIST_HEAD(conversation_list);
 static DEFINE_SPINLOCK(conversations_lock);
+static bool context_initialized = false;
 
-/*
- * Find a conversation context by ID
- * Must be called with conversations_lock held
- */
+/* Find a conversation context by ID */
 static struct conversation_context *find_conversation(int conversation_id)
 {
     struct conversation_context *ctx;
-    
+
     list_for_each_entry(ctx, &conversation_list, list) {
         if (ctx->conversation_id == conversation_id)
             return ctx;
     }
-    
+
     return NULL;
 }
 
-/*
- * Create a new conversation context
- * Returns pointer on success, NULL on failure
- */
+/* Create a new conversation context */
 static struct conversation_context *create_conversation(int conversation_id)
 {
     struct conversation_context *ctx;
-    
+
+    /* Check if memory management is initialized */
+    if (!memory_management_initialized()) {
+        pr_warn("create_conversation: Memory management not initialized\n");
+        return NULL;
+    }
+
+    /* Allocate with memory tracking */
     ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
     if (!ctx)
         return NULL;
-        
+
+    /* Register memory usage */
+    if (context_register_memory(conversation_id, sizeof(*ctx))) {
+        kfree(ctx);
+        return NULL;
+    }
+
     ctx->conversation_id = conversation_id;
     ctx->entry_count = 0;
     ctx->last_updated = ktime_get();
     INIT_LIST_HEAD(&ctx->entries);
     spin_lock_init(&ctx->lock);
-    
-    pr_debug("Created new conversation context with ID %d\n", conversation_id);
-    
+
+    atomic_inc(&conversations_created);
+
+    if (__ratelimit(&ratelimit_state)) {
+        pr_debug("Created new conversation context with ID %d (total: %d)\n",
+                 conversation_id, atomic_read(&conversations_created));
+    }
+
     return ctx;
 }
 
-/*
- * Add a new entry to the conversation context
- * Returns 0 on success, negative error code on failure
- */
-/*
- * Add a new entry to the conversation context
- */
+/* Add a new entry to a conversation context */
 int context_add_entry(int conversation_id, const char *role, const char *content)
 {
     struct conversation_context *ctx;
     struct context_entry *entry;
     unsigned long flags;
     int ret = 0;
+    size_t role_len, content_len;
+
+    /* Check if context management is initialized */
+    if (!context_initialized) {
+        pr_warn("context_add_entry: Context management not initialized\n");
+        return -EAGAIN;
+    }
 
     if (!role || !content || conversation_id <= 0)
         return -EINVAL;
 
+    /* Check input sizes */
+    role_len = strlen(role);
+    content_len = strlen(content);
+
+    if (role_len >= MAX_ROLE_NAME - 1) {
+        pr_warn("context_add_entry: Role too long (%zu > %d)\n",
+                role_len, MAX_ROLE_NAME - 1);
+        return -EMSGSIZE;
+    }
+
+    if (content_len >= MAX_CONTENT_LENGTH - 1) {
+        pr_warn("context_add_entry: Content too long (%zu > %d)\n",
+                content_len, MAX_CONTENT_LENGTH - 1);
+        return -EMSGSIZE;
+    }
+
+    /* Find or create conversation */
     spin_lock_irqsave(&conversations_lock, flags);
     ctx = find_conversation(conversation_id);
     if (!ctx) {
@@ -78,47 +126,65 @@ int context_add_entry(int conversation_id, const char *role, const char *content
     }
     spin_unlock_irqrestore(&conversations_lock, flags);
 
-    entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+    /* Allocate and initialize entry */
+    entry = context_allocate_entry(conversation_id);
     if (!entry)
         return -ENOMEM;
 
-    /* Use strscpy (kernel-approved) to copy strings */
-    if (strscpy(entry->role, role, sizeof(entry->role)) >= sizeof(entry->role) ||
-        strscpy(entry->content, content, sizeof(entry->content)) >= sizeof(entry->content)) {
-        kfree(entry);
-        return -EINVAL; /* Strings were truncated */
+    /* Copy strings safely */
+    ret = strscpy(entry->role, role, sizeof(entry->role));
+    if (ret < 0) {
+        context_free_entry(conversation_id, entry);
+        return -EMSGSIZE; /* More specific error for string truncation */
+    }
+
+    ret = strscpy(entry->content, content, sizeof(entry->content));
+    if (ret < 0) {
+        context_free_entry(conversation_id, entry);
+        return -EMSGSIZE; /* More specific error for string truncation */
     }
 
     entry->timestamp = ktime_get();
     INIT_LIST_HEAD(&entry->list);
 
+    /* Add to conversation with LRU eviction if needed */
     spin_lock_irqsave(&ctx->lock, flags);
     if (ctx->entry_count >= MAX_CONTEXT_ENTRIES) {
         struct context_entry *oldest;
         oldest = list_first_entry(&ctx->entries, struct context_entry, list);
         list_del(&oldest->list);
-        kfree(oldest);
-        ctx->entry_count--;
-        pr_debug("Removed oldest entry from conversation %d to make room\n", conversation_id);
+        /* Release the lock before freeing to prevent potential deadlock */
+        spin_unlock_irqrestore(&ctx->lock, flags);
+
+        context_free_entry(conversation_id, oldest);
+        atomic_inc(&entries_pruned);
+
+        if (__ratelimit(&ratelimit_state)) {
+            pr_debug("Removed oldest entry from conversation %d to make room (pruned: %d)\n",
+                     conversation_id, atomic_read(&entries_pruned));
+        }
+
+        /* Reacquire the lock to continue */
+        spin_lock_irqsave(&ctx->lock, flags);
+        ctx->entry_count--; /* Decrement after potential reschedule point */
     }
+
     list_add_tail(&entry->list, &ctx->entries);
     ctx->entry_count++;
     ctx->last_updated = ktime_get();
     spin_unlock_irqrestore(&ctx->lock, flags);
 
-    pr_debug("Added new entry to conversation %d, role: %s, content length: %zu\n",
-             conversation_id, role, strlen(content));
-    return ret;
+    atomic_inc(&entries_added);
+
+    if (__ratelimit(&ratelimit_state)) {
+        pr_debug("Added new entry to conversation %d, role: %s, content length: %zu (total: %d)\n",
+                 conversation_id, role, content_len, atomic_read(&entries_added));
+    }
+
+    return 0;
 }
 
-
-/*
- * Generate JSON representation of a conversation context
- * Returns 0 on success, negative error code on failure
- */
-/*
- * Generate JSON representation of a conversation context
- */
+/* Fix 1: Correct memory leak in context_get_conversation() in llm_context.c */
 int context_get_conversation(int conversation_id, struct llm_json_buffer *json_buf)
 {
     struct conversation_context *ctx;
@@ -126,7 +192,14 @@ int context_get_conversation(int conversation_id, struct llm_json_buffer *json_b
     unsigned long flags;
     int ret = 0;
     bool first = true;
-    char *entry_json;
+    char *entry_json = NULL;
+    size_t buffer_size = 1024; /* Start with larger buffer */
+
+    /* Check initialization */
+    if (!context_initialized) {
+        pr_warn("context_get_conversation: Context management not initialized\n");
+        return -EAGAIN;
+    }
 
     if (!json_buf || !json_buf->data || conversation_id <= 0)
         return -EINVAL;
@@ -135,7 +208,9 @@ int context_get_conversation(int conversation_id, struct llm_json_buffer *json_b
     ctx = find_conversation(conversation_id);
     if (!ctx) {
         spin_unlock_irqrestore(&conversations_lock, flags);
-        pr_debug("Conversation %d not found\n", conversation_id);
+        if (__ratelimit(&ratelimit_state)) {
+            pr_debug("Conversation %d not found\n", conversation_id);
+        }
         return -ENOENT;
     }
     spin_unlock_irqrestore(&conversations_lock, flags);
@@ -144,12 +219,12 @@ int context_get_conversation(int conversation_id, struct llm_json_buffer *json_b
     if (ret)
         return ret;
 
-    /* Dynamically allocate a temporary buffer to build each entry's JSON */
-    entry_json = kmalloc(512, GFP_KERNEL);
+    /* Allocate a larger temporary buffer for building each entry */
+    entry_json = kmalloc(buffer_size, GFP_KERNEL);
     if (!entry_json)
         return -ENOMEM;
 
-    /* Hold the conversation lock while iterating over entries */
+    /* Iterate through entries */
     spin_lock_irqsave(&ctx->lock, flags);
     list_for_each_entry(entry, &ctx->entries, list) {
         size_t entry_len = 0;
@@ -161,17 +236,33 @@ int context_get_conversation(int conversation_id, struct llm_json_buffer *json_b
         }
         first = false;
 
-        /* Format the beginning of the entry JSON into the dynamic buffer */
-        ret = snprintf(entry_json, 512, "{\"role\":\"%s\",\"content\":\"", entry->role);
-        if (ret < 0 || ret >= 512) {
-            ret = -ENOSPC;
+        /* Format entry JSON with buffer size check */
+        ret = snprintf(entry_json, buffer_size, "{\"role\":\"%s\",\"content\":\"", entry->role);
+        if (ret < 0) {
+            ret = -EIO; /* More specific error for formatting failure */
             break;
         }
+
+        if (ret >= buffer_size) {
+            /* Buffer too small, retry with a larger buffer */
+            char *new_entry_json;
+            buffer_size = ret + 64; /* Add some margin */
+            new_entry_json = kmalloc(buffer_size, GFP_KERNEL);
+            if (!new_entry_json) {
+                ret = -ENOMEM;
+                break;
+            }
+            kfree(entry_json); /* Free old buffer before assignment */
+            entry_json = new_entry_json;
+
+            ret = snprintf(entry_json, buffer_size, "{\"role\":\"%s\",\"content\":\"", entry->role);
+            if (ret < 0 || ret >= buffer_size) {
+                ret = -ENOSPC;
+                break;
+            }
+        }
+
         entry_len = ret;
-        if (entry_len + 20 >= 512) {
-            ret = -ENOSPC;
-            break;
-        }
 
         ret = append_json_string(json_buf, entry_json);
         if (ret)
@@ -187,533 +278,324 @@ int context_get_conversation(int conversation_id, struct llm_json_buffer *json_b
     }
     spin_unlock_irqrestore(&ctx->lock, flags);
 
-    kfree(entry_json);
+    kfree(entry_json); /* Free buffer regardless of success or failure */
 
     if (!ret)
         ret = append_json_string(json_buf, "]");
 
-    pr_debug("Generated JSON for conversation %d with %d entries\n",
-             conversation_id, ctx->entry_count);
+    atomic_inc(&json_generated);
+
+    if (__ratelimit(&ratelimit_state)) {
+        pr_debug("Generated JSON for conversation %d with %d entries (total: %d)\n",
+                 conversation_id, ctx->entry_count, atomic_read(&json_generated));
+    }
+
     return ret;
 }
 
 
-
-/*
- * Get the number of entries in a conversation
- * Returns entry count on success, negative error code on failure
- */
+/* Get entry count */
 int context_get_entry_count(int conversation_id)
 {
     struct conversation_context *ctx;
     unsigned long flags;
     int count;
-    
+
+    /* Check initialization */
+    if (!context_initialized)
+        return -EAGAIN;
+
     if (conversation_id <= 0)
         return -EINVAL;
-    
+
     spin_lock_irqsave(&conversations_lock, flags);
-    
     ctx = find_conversation(conversation_id);
     if (!ctx) {
         spin_unlock_irqrestore(&conversations_lock, flags);
         return 0; /* No conversation found, so 0 entries */
     }
-    
     count = ctx->entry_count;
-    
     spin_unlock_irqrestore(&conversations_lock, flags);
-    
+
     return count;
 }
 
-/*
- * Clear all entries from a conversation context
- * Returns 0 on success, negative error code on failure
- */
+/* Clear conversation with improved locking */
 int context_clear_conversation(int conversation_id)
 {
     struct conversation_context *ctx;
     struct context_entry *entry, *tmp;
     unsigned long flags;
-    
+    int cleared = 0;
+
+    /* Check initialization */
+    if (!context_initialized)
+        return -EAGAIN;
+
     if (conversation_id <= 0)
         return -EINVAL;
-    
+
     spin_lock_irqsave(&conversations_lock, flags);
-    
-    /* Find conversation context */
     ctx = find_conversation(conversation_id);
     if (!ctx) {
         spin_unlock_irqrestore(&conversations_lock, flags);
         return -ENOENT;
     }
-    
-    /* We found the context, now lock it */
-    spin_lock(&ctx->lock);
-    
-    /* Remove all entries */
+
+    /*
+     * To avoid nested spinlocks, we just get a reference to the conversation
+     * and release the global lock before acquiring the per-conversation lock
+     */
+    spin_unlock_irqrestore(&conversations_lock, flags);
+
+    /* Now handle the conversation with its own lock */
+    spin_lock_irqsave(&ctx->lock, flags);
     list_for_each_entry_safe(entry, tmp, &ctx->entries, list) {
         list_del(&entry->list);
-        kfree(entry);
+        /* Release lock before potential sleep in free */
+        spin_unlock_irqrestore(&ctx->lock, flags);
+
+        context_free_entry(conversation_id, entry);
+        cleared++;
+
+        /* Reacquire lock to continue iteration */
+        spin_lock_irqsave(&ctx->lock, flags);
     }
-    
+
     ctx->entry_count = 0;
     ctx->last_updated = ktime_get();
-    
-    spin_unlock(&ctx->lock);
-    spin_unlock_irqrestore(&conversations_lock, flags);
-    
-    pr_debug("Cleared all entries from conversation %d\n", conversation_id);
-    
+    spin_unlock_irqrestore(&ctx->lock, flags);
+
+    pr_debug("Cleared %d entries from conversation %d\n", cleared, conversation_id);
+
     return 0;
 }
 
-/*
- * Prune old conversations based on age threshold
- * Returns number of conversations pruned
- */
+/* Prune old conversations with improved locking */
 int context_prune_old_conversations(unsigned long age_threshold_ms)
 {
     struct conversation_context *ctx, *tmp_ctx;
     unsigned long flags;
     ktime_t cutoff_time;
     int pruned = 0;
-    
+
+    /* Check initialization */
+    if (!context_initialized)
+        return -EAGAIN;
+
     cutoff_time = ktime_sub_ms(ktime_get(), age_threshold_ms);
-    
+
     spin_lock_irqsave(&conversations_lock, flags);
-    
-    /* Find and remove old conversations */
-    list_for_each_entry_safe(ctx, tmp_ctx, &conversation_list, list) {
-        if (ktime_before(ctx->last_updated, cutoff_time)) {
-            struct context_entry *entry, *tmp_entry;
-            
-            /* Remove all entries */
-            spin_lock(&ctx->lock);
-            list_for_each_entry_safe(entry, tmp_entry, &ctx->entries, list) {
-                list_del(&entry->list);
-                kfree(entry);
-            }
-            spin_unlock(&ctx->lock);
-            
-            /* Remove conversation */
-            list_del(&ctx->list);
-            kfree(ctx);
-            
+
+    /* First pass: identify old conversations without modifying the list */
+    list_for_each_entry(ctx, &conversation_list, list) {
+        if (ktime_before(ctx->last_updated, cutoff_time))
             pruned++;
-        }
-    }
-    
-    spin_unlock_irqrestore(&conversations_lock, flags);
-    
-    if (pruned > 0) {
-        pr_info("Pruned %d old conversations (older than %lu ms)\n", 
-                pruned, age_threshold_ms);
-    }
-    
-    return pruned;
-}
-
-/*
- * Clean up all conversation contexts
- * Called when module is unloaded
- */
-void context_cleanup_all(void)
-{
-    struct conversation_context *ctx, *tmp_ctx;
-    struct context_entry *entry, *tmp_entry;
-    unsigned long flags;
-    int count = 0;
-    
-    spin_lock_irqsave(&conversations_lock, flags);
-    
-    /* Remove all conversations and entries */
-    list_for_each_entry_safe(ctx, tmp_ctx, &conversation_list, list) {
-        list_del(&ctx->list);
-        
-        /* Remove all entries in this conversation */
-        list_for_each_entry_safe(entry, tmp_entry, &ctx->entries, list) {
-            list_del(&entry->list);
-            kfree(entry);
-        }
-        
-        kfree(ctx);
-        count++;
-    }
-    
-    spin_unlock_irqrestore(&conversations_lock, flags);
-    
-    pr_info("Cleaned up %d conversations\n", count);
-}
-
-/*
- * Helper function to append a JSON string
- */
-int append_json_string(struct llm_json_buffer *buf, const char *str)
-{
-    size_t len;
-    
-    if (!buf || !buf->data || !str)
-        return -EINVAL;
-        
-    len = strlen(str);
-    if (buf->used + len >= buf->size)
-        return -ENOSPC;
-        
-    memcpy(buf->data + buf->used, str, len);
-    buf->used += len;
-    buf->data[buf->used] = '\0';
-    
-    return 0;
-}
-
-/*
- * Helper function to append a JSON number
- */
-int append_json_number(struct llm_json_buffer *buf, int number)
-{
-    char value[32];
-    int ret;
-    
-    if (!buf || !buf->data)
-        return -EINVAL;
-        
-    ret = snprintf(value, sizeof(value), "%d", number);
-    if (ret < 0 || ret >= sizeof(value))
-        return -EINVAL;
-        
-    return append_json_string(buf, value);
-}
-
-/*
- * Helper function to append a JSON float value (stored as integer * 100)
- */
-int append_json_float(struct llm_json_buffer *buf, int value_x100)
-{
-    char value[32];
-    int int_part, frac_part, ret;
-
-    int_part = value_x100 / 100;
-    frac_part = value_x100 % 100;
-    ret = snprintf(value, sizeof(value), "%d.%02d", int_part, frac_part);
-    if (ret < 0 || ret >= sizeof(value))
-        return -EINVAL;
-    return append_json_string(buf, value);
-}
-
-
-/*
- * Helper function to append a JSON boolean
- */
-int append_json_boolean(struct llm_json_buffer *buf, bool value)
-{
-    if (!buf || !buf->data)
-        return -EINVAL;
-        
-    return append_json_string(buf, value ? "true" : "false");
-}
-
-/*
- * Helper function to append a JSON value with proper escaping
- */
-int append_json_value(struct llm_json_buffer *buf, const char *value)
-{
-    size_t i, len;
-
-    if (!buf || !buf->data || !value)
-        return -EINVAL;
-
-    len = strlen(value);
-
-    for (i = 0; i < len; i++) {
-        char c = value[i];
-
-        /* Check if we need to escape this character */
-        if (c == '"' || c == '\\' || c == '\b' || c == '\f' ||
-            c == '\n' || c == '\r' || c == '\t') {
-
-            /* Make sure we have enough space (2 chars) */
-            if (buf->used + 2 >= buf->size)
-                return -ENOSPC;
-
-            buf->data[buf->used++] = '\\';
-
-            switch (c) {
-                case '"':  buf->data[buf->used++] = '"';  break;
-                case '\\': buf->data[buf->used++] = '\\'; break;
-                case '\b': buf->data[buf->used++] = 'b';  break;
-                case '\f': buf->data[buf->used++] = 'f';  break;
-                case '\n': buf->data[buf->used++] = 'n';  break;
-                case '\r': buf->data[buf->used++] = 'r';  break;
-                case '\t': buf->data[buf->used++] = 't';  break;
-            }
-        } else if ((unsigned char)c < 32) {
-            /* Control characters need special handling (6 chars for \uXXXX) */
-            if (buf->used + 6 >= buf->size)
-                return -ENOSPC;
-
-            buf->data[buf->used++] = '\\';
-            buf->data[buf->used++] = 'u';
-            buf->data[buf->used++] = '0';
-            buf->data[buf->used++] = '0';
-
-            /* Convert to hex */
-            snprintf(buf->data + buf->used, 3, "%02x", (unsigned char)c);
-            buf->used += 2;
-        } else {
-            /* Normal character */
-            if (buf->used + 1 >= buf->size)
-                return -ENOSPC;
-
-            buf->data[buf->used++] = c;
-        }
     }
 
-    buf->data[buf->used] = '\0';
-    return 0;
-}
-
-/*
- * Extract content from JSON response
- * This is a simple parser to extract content from various API responses
- */
-int extract_response_content(const char *json, char *output, size_t output_size)
-{
-    const char *content_start = NULL;
-    const char *content_end = NULL;
-    int json_depth = 0;
-    bool in_string = false;
-
-    if (!json || !output || output_size == 0)
-        return -EINVAL;
-
-    /* Clear output buffer */
-    output[0] = '\0';
-
-    /* Try different formats based on provider patterns */
-
-    /* OpenAI format: "content":"..." */
-    content_start = strstr(json, "\"content\":\"");
-    if (content_start) {
-        content_start += 11;  /* Skip "content":" */
-        goto process_content;
-    }
-
-    /* Anthropic format: might be same as OpenAI */
-
-    /* Gemini format: "text":"..." */
-    content_start = strstr(json, "\"text\":\"");
-    if (content_start) {
-        content_start += 8;  /* Skip "text":" */
-        goto process_content;
-    }
-
-    /* No recognizable format found */
-    return -EINVAL;
-
-    process_content:
-    /* Find end of content by properly handling nested structures */
-    content_end = content_start;
-    while (*content_end) {
-        if (*content_end == '\\' && *(content_end + 1)) {
-            content_end += 2; /* Skip escaped character */
-            continue;
-        }
-
-        if (*content_end == '{' && !in_string) json_depth++;
-        if (*content_end == '}' && !in_string) json_depth--;
-
-        if (*content_end == '"') {
-            /* If we're at the top level and this is the closing quote */
-            if (json_depth == 0 && content_end > content_start) {
-                break;
-            }
-            in_string = !in_string;
-        }
-
-        content_end++;
-    }
-
-    if (*content_end != '"')
-        return -EINVAL; /* No closing quote found */
-
-    {
-        size_t content_len = content_end - content_start;
-        size_t out_idx = 0;
-        size_t i;
-
-        /* Make sure we don't overflow output buffer */
-        if (content_len >= output_size)
-            content_len = output_size - 1;
-
-        /* Copy and unescape the content */
-        for (i = 0; i < content_len && out_idx < output_size - 1; i++) {
-            if (content_start[i] == '\\' && i + 1 < content_len) {
-                i++;
-                switch (content_start[i]) {
-                    case 'n': output[out_idx++] = '\n'; break;
-                    case 'r': output[out_idx++] = '\r'; break;
-                    case 't': output[out_idx++] = '\t'; break;
-                    case 'b': output[out_idx++] = '\b'; break;
-                    case 'f': output[out_idx++] = '\f'; break;
-                    case '\\': output[out_idx++] = '\\'; break;
-                    case '"': output[out_idx++] = '"'; break;
-                    case 'u': /* Unicode escape */
-                        /* This would require more complex handling for unicode */
-                        if (i + 4 < content_len && out_idx < output_size - 2) {
-                            /* Simple handling: just output a placeholder */
-                            output[out_idx++] = '?';
-                            i += 4; /* Skip the 4 hex digits */
-                        } else {
-                            /* Not enough characters left */
-                            i = content_len; /* Exit loop */
-                        }
-                        break;
-                    default:
-                        if (out_idx < output_size - 1) {
-                            output[out_idx++] = content_start[i];
-                        }
-                        break;
-                }
-            } else {
-                if (out_idx < output_size - 1) {
-                    output[out_idx++] = content_start[i];
-                }
-            }
-        }
-
-        output[out_idx] = '\0';
-        return out_idx;
-    }
-}
-
-/*
- * Parse token count from JSON response
- * Returns 0 on success, negative error on failure
- */
-int parse_token_count(const char *json, int *prompt_tokens,
-                      int *completion_tokens, int *total_tokens)
-{
-    const char *usage_start;
-    int ret_prompt = -EINVAL;
-    int ret_completion = -EINVAL;
-    int ret_total = -EINVAL;
-
-    if (!json || !prompt_tokens || !completion_tokens || !total_tokens)
-        return -EINVAL;
-
-    /* Initialize outputs */
-    *prompt_tokens = 0;
-    *completion_tokens = 0;
-    *total_tokens = 0;
-
-    /* Find usage section */
-    usage_start = strstr(json, "\"usage\"");
-    if (!usage_start) {
-        return -EINVAL;
-    }
-
-    /* Parse prompt_tokens */
-    {
-        const char *pt = strstr(usage_start, "\"prompt_tokens\"");
-        if (pt) {
-            pt = strchr(pt, ':');
-            if (pt) {
-                ret_prompt = kstrtoint(pt + 1, 10, prompt_tokens);
-                if (ret_prompt) {
-                    *prompt_tokens = 0;
-                }
-            }
-        }
-    }
-
-    /* Parse completion_tokens */
-    {
-        const char *ct = strstr(usage_start, "\"completion_tokens\"");
-        if (ct) {
-            ct = strchr(ct, ':');
-            if (ct) {
-                ret_completion = kstrtoint(ct + 1, 10, completion_tokens);
-                if (ret_completion) {
-                    *completion_tokens = 0;
-                }
-            }
-        }
-    }
-
-    /* Parse total_tokens */
-    {
-        const char *tt = strstr(usage_start, "\"total_tokens\"");
-        if (tt) {
-            tt = strchr(tt, ':');
-            if (tt) {
-                ret_total = kstrtoint(tt + 1, 10, total_tokens);
-                if (ret_total) {
-                    *total_tokens = 0;
-                }
-            }
-        }
-    }
-
-    /* Only return success if we found at least one valid token count */
-    if (ret_prompt == 0 || ret_completion == 0 || ret_total == 0) {
+    if (pruned == 0) {
+        /* Early exit if no conversations need pruning */
+        spin_unlock_irqrestore(&conversations_lock, flags);
         return 0;
     }
 
-    return -EINVAL;
+    /* Second pass: remove old conversations */
+    pruned = 0;
+    list_for_each_entry_safe(ctx, tmp_ctx, &conversation_list, list) {
+        if (ktime_before(ctx->last_updated, cutoff_time)) {
+            struct context_entry *entry, *tmp_entry;
+            int conversation_id = ctx->conversation_id;
+
+            /* Remove from global list first */
+            list_del(&ctx->list);
+
+            /* Release global lock before handling entries */
+            spin_unlock_irqrestore(&conversations_lock, flags);
+
+            /* Handle entries with conversation lock */
+            spin_lock_irqsave(&ctx->lock, flags);
+            list_for_each_entry_safe(entry, tmp_entry, &ctx->entries, list) {
+                list_del(&entry->list);
+                /* Release lock before freeing to avoid nested locks */
+                spin_unlock_irqrestore(&ctx->lock, flags);
+
+                context_free_entry(conversation_id, entry);
+
+                /* Reacquire lock to continue */
+                spin_lock_irqsave(&ctx->lock, flags);
+            }
+            spin_unlock_irqrestore(&ctx->lock, flags);
+
+            /* Free conversation after all entries are processed */
+            context_unregister_memory(conversation_id, sizeof(*ctx));
+            kfree(ctx);
+            pruned++;
+
+            /* Reacquire global lock to continue iteration */
+            spin_lock_irqsave(&conversations_lock, flags);
+        }
+    }
+
+    spin_unlock_irqrestore(&conversations_lock, flags);
+
+    if (pruned > 0) {
+        pr_info("Pruned %d old conversations (older than %lu ms)\n",
+                pruned, age_threshold_ms);
+    }
+
+    return pruned;
 }
 
-/*
- * Initialize a JSON buffer
- */
-int json_buffer_init(struct llm_json_buffer *buf, size_t size)
+/* Fix 1: Correct lock hierarchy violation in context_cleanup_all() in llm_context.c */
+void context_cleanup_all(void)
 {
-    if (!buf)
-        return -EINVAL;
+    struct conversation_context *ctx, *tmp_ctx;
+    unsigned long flags;
+    int count = 0;
+    struct list_head temp_list;
 
-    /* Use GFP_ATOMIC for allocations that might happen in interrupt context */
-    buf->data = kmalloc(size, GFP_ATOMIC);
-    if (!buf->data)
-        return -ENOMEM;
+    /* Even if not initialized, try to clean up */
+    context_initialized = false;
 
-    buf->size = size;
-    buf->used = 0;
-    buf->data[0] = '\0';
+    INIT_LIST_HEAD(&temp_list);
 
+    /* First, unlink all contexts from the global list with proper locking */
+    spin_lock_irqsave(&conversations_lock, flags);
+    list_for_each_entry(ctx, &conversation_list, list) {
+        count++;
+    }
+    list_splice_init(&conversation_list, &temp_list);
+    spin_unlock_irqrestore(&conversations_lock, flags);
+
+    /* Now process each context without holding the global lock */
+    list_for_each_entry_safe(ctx, tmp_ctx, &temp_list, list) {
+        struct context_entry *entry, *tmp_entry;
+        int conversation_id = ctx->conversation_id;
+        unsigned long ctx_flags;
+
+        /* Remove from temp list */
+        list_del(&ctx->list);
+
+        /* Process entries with conversation lock */
+        spin_lock_irqsave(&ctx->lock, ctx_flags);
+        list_for_each_entry_safe(entry, tmp_entry, &ctx->entries, list) {
+            list_del(&entry->list);
+            /* Release lock before freeing */
+            spin_unlock_irqrestore(&ctx->lock, ctx_flags);
+
+            context_free_entry(conversation_id, entry);
+
+            /* Reacquire lock to continue */
+            spin_lock_irqsave(&ctx->lock, ctx_flags);
+        }
+        spin_unlock_irqrestore(&ctx->lock, ctx_flags);
+
+        /* Free conversation */
+        context_unregister_memory(conversation_id, sizeof(*ctx));
+        kfree(ctx);
+    }
+
+    pr_info("Cleaned up %d conversations\n", count);
+}
+
+
+/* Get statistics for monitoring */
+void context_get_stats(int *total_conversations, int *total_entries,
+                       int *entries_added_count, int *entries_pruned_count)
+{
+    if (total_conversations)
+        *total_conversations = atomic_read(&conversations_created);
+
+    if (total_entries)
+        *total_entries = atomic_read(&entries_added) - atomic_read(&entries_pruned);
+
+    if (entries_added_count)
+        *entries_added_count = atomic_read(&entries_added);
+
+    if (entries_pruned_count)
+        *entries_pruned_count = atomic_read(&entries_pruned);
+}
+
+/* Show statistics via sysfs */
+ssize_t context_stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int total_conversations, total_entries, added, pruned, json_count;
+
+    total_conversations = atomic_read(&conversations_created);
+    added = atomic_read(&entries_added);
+    pruned = atomic_read(&entries_pruned);
+    total_entries = added - pruned;
+    json_count = atomic_read(&json_generated);
+
+    return scnprintf(buf, PAGE_SIZE,
+                     "Conversation Context Statistics:\n"
+                     "  Conversations Created: %d\n"
+                     "  Entries Added: %d\n"
+                     "  Entries Pruned: %d\n"
+                     "  Current Entries: %d\n"
+                     "  JSON Generations: %d\n"
+                     "  System Initialized: %s\n",
+                     total_conversations,
+                     added,
+                     pruned,
+                     total_entries,
+                     json_count,
+                     context_initialized ? "Yes" : "No");
+}
+
+/* Initialize context management system */
+int context_management_init(void)
+{
+    if (context_initialized) {
+        pr_warn("context_management_init: Already initialized\n");
+        return 0;
+    }
+
+    /* Reset statistics */
+    atomic_set(&entries_added, 0);
+    atomic_set(&conversations_created, 0);
+    atomic_set(&entries_pruned, 0);
+    atomic_set(&json_generated, 0);
+
+    /* Initialize ratelimit state */
+    ratelimit_state.interval = 5 * HZ;  /* 5 seconds */
+    ratelimit_state.burst = 10;
+
+    context_initialized = true;
+    pr_info("Conversation context management initialized\n");
     return 0;
 }
 
-/*
- * Free a JSON buffer
- */
-void json_buffer_free(struct llm_json_buffer *buf)
+/* Clean up context management system */
+void context_management_cleanup(void)
 {
-    if (!buf)
+    if (!context_initialized) {
+        pr_warn("context_management_cleanup: Not initialized\n");
         return;
-        
-    if (buf->data) {
-        kfree(buf->data);
-        buf->data = NULL;
     }
-    
-    buf->size = 0;
-    buf->used = 0;
+
+    /* Mark as uninitialized before cleanup to prevent new entries */
+    context_initialized = false;
+
+    /* Clean up all conversations */
+    context_cleanup_all();
+
+    pr_info("Conversation context management cleaned up\n");
 }
 
-/* Module exports */
+/* Check if context management is initialized */
+bool context_management_initialized(void)
+{
+    return context_initialized;
+}
+
 EXPORT_SYMBOL(context_add_entry);
 EXPORT_SYMBOL(context_get_conversation);
 EXPORT_SYMBOL(context_clear_conversation);
 EXPORT_SYMBOL(context_cleanup_all);
 EXPORT_SYMBOL(context_get_entry_count);
 EXPORT_SYMBOL(context_prune_old_conversations);
-EXPORT_SYMBOL(append_json_string);
-EXPORT_SYMBOL(append_json_value);
-EXPORT_SYMBOL(append_json_number);
-EXPORT_SYMBOL(append_json_float);
-EXPORT_SYMBOL(append_json_boolean);
-EXPORT_SYMBOL(json_buffer_init);
-EXPORT_SYMBOL(json_buffer_free);
-EXPORT_SYMBOL(extract_response_content);
-EXPORT_SYMBOL(parse_token_count);
+EXPORT_SYMBOL(context_get_stats);
+EXPORT_SYMBOL(context_management_init);
+EXPORT_SYMBOL(context_management_cleanup);
+EXPORT_SYMBOL(context_management_initialized);
