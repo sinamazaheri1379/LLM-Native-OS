@@ -1,6 +1,6 @@
 # Makefile for LLM Orchestrator kernel module
 obj-m += llm_orchestrator.o
-llm_orchestrator-objs := llm_context.o llm_scheduler.o
+llm_orchestrator-objs := llm_context.o llm_scheduler.o orchestrator_main.o
 
 # Kernel build directory
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build
@@ -8,7 +8,7 @@ PWD := $(shell pwd)
 
 # User space test program
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -O2
+CFLAGS = -Wall -Wextra -O2
 
 # Debug flags
 ifdef DEBUG

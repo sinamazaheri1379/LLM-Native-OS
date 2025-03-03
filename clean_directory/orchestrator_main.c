@@ -11,7 +11,7 @@
 #include <linux/net.h>
 #include <linux/in.h>
 #include <linux/socket.h>
-#include <linux/kvec.h>
+#include <linux/uio.h>
 #include <net/sock.h>
 #include <linux/jiffies.h>
 #include <linux/timer.h>
@@ -21,10 +21,26 @@
 #include <linux/ktime.h>
 #include <linux/sched.h>
 #include <linux/version.h>
+#include <linux/inet.h>
+#include <uapi/linux/time.h>
+#include <uapi/linux/socket.h>
 #include "llm_orchestrator.h"
 
 #define MODULE_NAME "llm_orchestrator"
 #define DRIVER_VERSION "2.0"
+
+
+#ifndef HAVE_STRCASESTR
+static inline char *strcasestr(const char *haystack, const char *needle)
+{
+    size_t needle_len = strlen(needle);
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, needle_len) == 0)
+            return (char *)haystack;
+    }
+    return NULL;
+}
+#endif
 
 /* Module parameters for API keys */
 static char *openai_api_key = NULL;
@@ -153,11 +169,9 @@ static int network_send_request(const char *host_ip, int port,
     iov[1].iov_base = buf->data;
     iov[1].iov_len = buf->used;
     {
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        long timeout_jiffies = msecs_to_jiffies(timeout_ms);
         ret = sock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-                              (char *)&tv, sizeof(tv));
+                            (char *)&timeout_jiffies, sizeof(timeout_jiffies));
         if (ret < 0) {
             pr_err("network_send_request: Failed to set socket timeout: %d\n", ret);
             goto release_sock;
@@ -606,7 +620,6 @@ int llm_send_anthropic(const char *api_key,
 
 static int format_gemini_request(struct llm_request *req, struct llm_json_buffer *json_buf)
 {
-    struct llm_json_buffer context_buf;
     int ret;
     const char *model;
 
@@ -836,6 +849,8 @@ static void maintenance_timer_callback(unsigned long data)
 /* --- Character Device File Operations --- */
 static int orchestrator_open(struct inode *inode, struct file *file)
 {
+    /* Store scheduler state pointer in task struct */
+    current->scheduler_data = &global_scheduler;
     return 0;
 }
 
@@ -1111,7 +1126,12 @@ static int __init orchestrator_init(void)
         return ret;
     }
 
+    /* In orchestrator_init */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
     orchestrator_class = class_create(THIS_MODULE, MODULE_NAME);
+#else
+    orchestrator_class = class_create(MODULE_NAME);
+#endif
     if (IS_ERR(orchestrator_class)) {
         cdev_del(&orchestrator_cdev);
         unregister_chrdev_region(dev, 1);
