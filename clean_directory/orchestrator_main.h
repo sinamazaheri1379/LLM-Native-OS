@@ -40,6 +40,7 @@
 #define SCHEDULER_FIFO 6
 #define SCHEDULER_MAX_ALGORITHM SCHEDULER_FIFO
 /* Data structures for requests, responses, contexts */
+extern spinlock_t conversations_lock;
 struct llm_json_buffer {
     char *data;
     size_t size;
@@ -175,4 +176,7 @@ int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct 
 const char *get_default_model(int provider);
 bool is_model_supported(int provider, const char *model_name);
 
+
+struct scheduler_state *get_scheduler_state(void);
+static struct conversation_context *find_conversation(int conversation_id);
 #endif /* ORCHESTRATOR_MAIN_H */

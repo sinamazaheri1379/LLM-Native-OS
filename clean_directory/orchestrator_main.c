@@ -6,6 +6,7 @@
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/timer.h>
+#include <linux/version.h>
 #include "orchestrator_main.h"
 
 #define MODULE_NAME "llm_orchestrator"
@@ -63,7 +64,166 @@ static struct file_operations orchestrator_fops = {
  * Implementation of provider-specific API functions
  * These were mentioned in header files but missing from the implementation
  */
+#define MAX_SCHEDULER_REGISTRY 64
 
+struct scheduler_registry_entry {
+    pid_t pid;
+    struct scheduler_state *state;
+    atomic_t in_use;
+};
+
+static struct scheduler_registry_entry scheduler_registry[MAX_SCHEDULER_REGISTRY];
+static DEFINE_SPINLOCK(scheduler_registry_lock);
+static atomic_t registry_initialized = ATOMIC_INIT(0);
+
+/* Initialize the scheduler registry */
+static int scheduler_registry_init(void)
+{
+    int i;
+
+    if (atomic_read(&registry_initialized) != 0)
+        return 0;  /* Already initialized */
+
+    spin_lock(&scheduler_registry_lock);
+
+    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
+        scheduler_registry[i].pid = 0;
+        scheduler_registry[i].state = NULL;
+        atomic_set(&scheduler_registry[i].in_use, 0);
+    }
+
+    spin_unlock(&scheduler_registry_lock);
+    atomic_set(&registry_initialized, 1);
+
+    pr_info("Scheduler registry initialized\n");
+    return 0;
+}
+
+/* Clean up the scheduler registry */
+static void scheduler_registry_cleanup(void)
+{
+    int i;
+
+    if (atomic_read(&registry_initialized) == 0)
+        return;  /* Not initialized */
+
+    spin_lock(&scheduler_registry_lock);
+
+    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
+        if (atomic_read(&scheduler_registry[i].in_use) != 0) {
+            scheduler_registry[i].pid = 0;
+            scheduler_registry[i].state = NULL;
+            atomic_set(&scheduler_registry[i].in_use, 0);
+        }
+    }
+
+    spin_unlock(&scheduler_registry_lock);
+    atomic_set(&registry_initialized, 0);
+
+    pr_info("Scheduler registry cleaned up\n");
+}
+
+/* Store scheduler state in registry */
+void set_scheduler_state(struct scheduler_state *state)
+{
+    int i, free_idx = -1;
+    pid_t current_pid;
+
+    if (!state || atomic_read(&registry_initialized) == 0) {
+        pr_err("set_scheduler_state: Registry not initialized or invalid state\n");
+        return;
+    }
+
+    current_pid = task_pid_nr(current);
+
+    spin_lock(&scheduler_registry_lock);
+
+    /* Check if entry already exists or find a free slot */
+    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
+        if (scheduler_registry[i].pid == current_pid &&
+            atomic_read(&scheduler_registry[i].in_use) != 0) {
+            /* Update existing entry */
+            scheduler_registry[i].state = state;
+            spin_unlock(&scheduler_registry_lock);
+            return;
+        }
+
+        if (free_idx == -1 && atomic_read(&scheduler_registry[i].in_use) == 0)
+            free_idx = i;
+    }
+
+    /* Add new entry if free slot found */
+    if (free_idx != -1) {
+        scheduler_registry[free_idx].pid = current_pid;
+        scheduler_registry[free_idx].state = state;
+        atomic_set(&scheduler_registry[free_idx].in_use, 1);
+        spin_unlock(&scheduler_registry_lock);
+        return;
+    }
+
+    spin_unlock(&scheduler_registry_lock);
+    pr_warn("set_scheduler_state: No free slots in registry\n");
+}
+
+/* Get scheduler state from registry */
+struct scheduler_state *get_scheduler_state(void)
+{
+    int i;
+    pid_t current_pid;
+    struct scheduler_state *state = NULL;
+
+    if (atomic_read(&registry_initialized) == 0) {
+        pr_err("get_scheduler_state: Registry not initialized\n");
+        return NULL;
+    }
+
+    current_pid = task_pid_nr(current);
+
+    spin_lock(&scheduler_registry_lock);
+
+    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
+        if (scheduler_registry[i].pid == current_pid &&
+            atomic_read(&scheduler_registry[i].in_use) != 0) {
+            state = scheduler_registry[i].state;
+            break;
+        }
+    }
+
+    spin_unlock(&scheduler_registry_lock);
+
+    /* If no entry found, use global scheduler as fallback */
+    if (!state) {
+        state = &global_scheduler;
+    }
+
+    return state;
+}
+
+/* Remove scheduler state from registry */
+void remove_scheduler_state(void)
+{
+    int i;
+    pid_t current_pid;
+
+    if (atomic_read(&registry_initialized) == 0)
+        return;
+
+    current_pid = task_pid_nr(current);
+
+    spin_lock(&scheduler_registry_lock);
+
+    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
+        if (scheduler_registry[i].pid == current_pid &&
+            atomic_read(&scheduler_registry[i].in_use) != 0) {
+            scheduler_registry[i].pid = 0;
+            scheduler_registry[i].state = NULL;
+            atomic_set(&scheduler_registry[i].in_use, 0);
+            break;
+        }
+    }
+
+    spin_unlock(&scheduler_registry_lock);
+}
 /* OpenAI API implementation */
 int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
@@ -681,17 +841,23 @@ static void maintenance_timer_callback(unsigned long data)
     mod_timer(&maintenance_timer, jiffies + HZ * 60 * 10); /* Run every 10 minutes */
 }
 
-/* Character device file operations */
+/* Update orchestrator_open function */
 static int orchestrator_open(struct inode *inode, struct file *file)
 {
-    /* Store scheduler state pointer in task struct for later use */
-    current->scheduler_data = &global_scheduler;
+    /* Initialize registry if needed */
+    if (atomic_read(&registry_initialized) == 0)
+        scheduler_registry_init();
+
+    /* Store scheduler state in registry */
+    set_scheduler_state(&global_scheduler);
     return 0;
 }
 
+/* Update orchestrator_release function */
 static int orchestrator_release(struct inode *inode, struct file *file)
 {
-    current->scheduler_data = NULL;
+    /* Remove from registry */
+    remove_scheduler_state();
     return 0;
 }
 
@@ -791,6 +957,218 @@ static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t cou
     mutex_unlock(&orchestrator_mutex);
     return ret;
 }
+/* Shows current scheduler algorithm */
+static ssize_t scheduler_algorithm_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int algorithm = atomic_read(&global_scheduler.current_algorithm);
+    const char *algorithm_name;
+
+    switch (algorithm) {
+        case SCHEDULER_ROUND_ROBIN:
+            algorithm_name = "Round Robin";
+            break;
+        case SCHEDULER_WEIGHTED:
+            algorithm_name = "Weighted";
+            break;
+        case SCHEDULER_PRIORITY:
+            algorithm_name = "Priority";
+            break;
+        case SCHEDULER_PERFORMANCE:
+            algorithm_name = "Performance";
+            break;
+        case SCHEDULER_COST_AWARE:
+            algorithm_name = "Cost Aware";
+            break;
+        case SCHEDULER_FALLBACK:
+            algorithm_name = "Fallback";
+            break;
+        case SCHEDULER_FIFO:
+            algorithm_name = "FIFO";
+            break;
+        default:
+            algorithm_name = "Unknown";
+            break;
+    }
+
+    return scnprintf(buf, PAGE_SIZE, "Current algorithm: %s (%d)\n", algorithm_name, algorithm);
+}
+
+/* Sets the scheduler algorithm */
+static ssize_t scheduler_algorithm_store(struct device *dev, struct device_attribute *attr,
+                                        const char *buf, size_t count)
+{
+    int algorithm;
+    int ret;
+
+    ret = kstrtoint(buf, 10, &algorithm);
+    if (ret < 0)
+        return ret;
+
+    if (algorithm < 0 || algorithm > SCHEDULER_MAX_ALGORITHM)
+        return -EINVAL;
+
+    atomic_set(&global_scheduler.current_algorithm, algorithm);
+    return count;
+}
+
+/* Shows provider metrics */
+static ssize_t provider_metrics_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int i;
+    ssize_t len = 0;
+    const char *provider_names[PROVIDER_COUNT] = {"OpenAI", "Anthropic", "Google Gemini"};
+
+    len += scnprintf(buf + len, PAGE_SIZE - len, "Provider Metrics:\n");
+    len += scnprintf(buf + len, PAGE_SIZE - len, "----------------\n");
+
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        int total = atomic_read(&global_scheduler.metrics[i].total_requests);
+        int successful = atomic_read(&global_scheduler.metrics[i].successful_requests);
+        int failed = atomic_read(&global_scheduler.metrics[i].failed_requests);
+        int timeouts = atomic_read(&global_scheduler.metrics[i].timeouts);
+        int rate_limited = atomic_read(&global_scheduler.metrics[i].rate_limited);
+        int status = atomic_read(&global_scheduler.metrics[i].current_status);
+        s64 total_latency = atomic64_read(&global_scheduler.metrics[i].total_latency_ms);
+        s64 avg_latency = total < 1 ? 0 : div64_s64(total_latency, max(successful, 1));
+        int tokens = atomic_read(&global_scheduler.metrics[i].total_tokens);
+
+        len += scnprintf(buf + len, PAGE_SIZE - len, "\n%s:\n", provider_names[i]);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Status: %s\n",
+                        status ? "Available" : "Rate Limited");
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Total Requests: %d\n", total);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Successful: %d\n", successful);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Failed: %d\n", failed);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Timeouts: %d\n", timeouts);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Rate Limited: %d\n", rate_limited);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Success Rate: %d%%\n",
+                        total > 0 ? (successful * 100) / total : 0);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Avg Latency: %lld ms\n", avg_latency);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Min Latency: %lu ms\n",
+                        global_scheduler.metrics[i].min_latency_ms == ULONG_MAX ? 0 :
+                        global_scheduler.metrics[i].min_latency_ms);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Max Latency: %lu ms\n",
+                        global_scheduler.metrics[i].max_latency_ms);
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  Total Tokens: %d\n", tokens);
+    }
+
+    return len;
+}
+
+/* Resets provider metrics */
+static ssize_t reset_metrics_store(struct device *dev, struct device_attribute *attr,
+                                 const char *buf, size_t count)
+{
+    if (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y') {
+        scheduler_reset_metrics(&global_scheduler);
+        pr_info("LLM Orchestrator: Provider metrics reset\n");
+    }
+    return count;
+}
+
+/* Shows scheduler weights */
+static ssize_t scheduler_weights_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    const char *provider_names[PROVIDER_COUNT] = {"OpenAI", "Anthropic", "Google Gemini"};
+    int i;
+    ssize_t len = 0;
+    int total = 0;
+
+    len += scnprintf(buf + len, PAGE_SIZE - len, "Provider Weights:\n");
+
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        len += scnprintf(buf + len, PAGE_SIZE - len, "  %s: %d%%\n",
+                       provider_names[i], global_scheduler.weights[i]);
+        total += global_scheduler.weights[i];
+    }
+
+    len += scnprintf(buf + len, PAGE_SIZE - len, "Total: %d%%\n", total);
+    len += scnprintf(buf + len, PAGE_SIZE - len, "Auto-adjust: %s\n",
+                    global_scheduler.auto_adjust ? "Enabled" : "Disabled");
+
+    return len;
+}
+
+/* Sets scheduler weights */
+static ssize_t scheduler_weights_store(struct device *dev, struct device_attribute *attr,
+                                     const char *buf, size_t count)
+{
+    int w1, w2, w3;
+    int ret;
+
+    /* Format: "w1,w2,w3" for the three providers */
+    ret = sscanf(buf, "%d,%d,%d", &w1, &w2, &w3);
+    if (ret != 3)
+        return -EINVAL;
+
+    /* Validate weights */
+    if (w1 < 0 || w2 < 0 || w3 < 0)
+        return -EINVAL;
+    if (w1 + w2 + w3 != 100)
+        return -EINVAL;
+
+    /* Update weights */
+    global_scheduler.weights[0] = w1;
+    global_scheduler.weights[1] = w2;
+    global_scheduler.weights[2] = w3;
+
+    pr_info("LLM Orchestrator: Weights updated to %d%%,%d%%,%d%%\n", w1, w2, w3);
+    return count;
+}
+
+/* Shows auto-adjust setting */
+static ssize_t auto_adjust_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE, "Auto-adjust: %s\n",
+                    global_scheduler.auto_adjust ? "Enabled" : "Disabled");
+}
+
+/* Sets auto-adjust setting */
+static ssize_t auto_adjust_store(struct device *dev, struct device_attribute *attr,
+                               const char *buf, size_t count)
+{
+    bool enable;
+
+    if (kstrtobool(buf, &enable))
+        return -EINVAL;
+
+    global_scheduler.auto_adjust = enable;
+    pr_info("LLM Orchestrator: Auto-adjust %s\n", enable ? "enabled" : "disabled");
+    return count;
+}
+
+/* Shows FIFO queue status */
+static ssize_t fifo_status_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    ssize_t len = 0;
+
+    len += scnprintf(buf + len, PAGE_SIZE - len, "FIFO Queue Status:\n");
+    len += scnprintf(buf + len, PAGE_SIZE - len, "  Queue Size: %d/%d\n",
+                    global_scheduler.fifo.count, FIFO_QUEUE_SIZE);
+    len += scnprintf(buf + len, PAGE_SIZE - len, "  Head: %d\n", global_scheduler.fifo.head);
+    len += scnprintf(buf + len, PAGE_SIZE - len, "  Tail: %d\n", global_scheduler.fifo.tail);
+
+    return len;
+}
+
+/* Shows context status */
+static ssize_t context_status_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int total_conversations, total_entries, entries_added, entries_pruned;
+    context_get_stats(&total_conversations, &total_entries, &entries_added, &entries_pruned);
+
+    return scnprintf(buf, PAGE_SIZE,
+                   "Context Status:\n"
+                   "  Active Conversations: %d\n"
+                   "  Total Entries: %d\n"
+                   "  Entries Added: %d\n"
+                   "  Entries Pruned: %d\n"
+                   "  Auto-prune Threshold: %d minutes\n",
+                   total_conversations,
+                   total_entries,
+                   entries_added,
+                   entries_pruned,
+                   prune_threshold_mins);
+}
 
 /* Sysfs interfaces for configuration and statistics */
 static DEVICE_ATTR(scheduler_algorithm, 0644, scheduler_algorithm_show, scheduler_algorithm_store);
@@ -850,8 +1228,16 @@ static int __init orchestrator_init(void)
         goto fail_tls;
     }
     pr_info("LLM Orchestrator: TLS subsystem initialized\n");
+    /*Step 8 Scheduler Registry Init*/
+    ret = scheduler_registry_init();
+    if (ret) {
+        pr_err("orchestrator_init: Failed to initialize scheduler registry: %d\n", ret);
+        goto fail_registry;
+    }
+    pr_info("LLM Orchestrator: Scheduler registry initialized\n");
 
-    /* Step 6: Initialize scheduler and global state */
+
+    /* Step 7: Initialize scheduler and global state */
     scheduler_init(&global_scheduler);
     set_scheduler_state(&global_scheduler);
     memset(&global_response, 0, sizeof(global_response));
@@ -998,6 +1384,8 @@ static int __init orchestrator_init(void)
     return 0;
 
     /* Error handling with proper cleanup */
+    fail_registry:
+    pr_info("Registry Failed");
     fail_sysfs:
     device_destroy(orchestrator_class, MKDEV(major_number, 0));
     fail_device:
@@ -1075,10 +1463,11 @@ static void __exit orchestrator_exit(void)
     fifo_cleanup(&global_scheduler.fifo);
     memory_management_cleanup();
     pr_debug("LLM Orchestrator: Memory management cleaned up\n");
-
+	scheduler_registry_cleanup();
+    pr_debug("LLM Orchestrator: Scheduler registry cleaned up\n");
+    
     pr_info("LLM Orchestrator: Module unloaded\n");
 }
-
 
 
 

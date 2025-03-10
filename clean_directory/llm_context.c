@@ -25,11 +25,11 @@ static DEFINE_RATELIMIT_STATE(ratelimit_state, 5 * HZ, 10);
 
 /* Global list of conversation contexts */
 static LIST_HEAD(conversation_list);
-static DEFINE_SPINLOCK(conversations_lock);
+DEFINE_SPINLOCK(conversations_lock);
 static bool context_initialized = false;
 
 /* Find a conversation context by ID */
-static struct conversation_context *find_conversation(int conversation_id)
+struct conversation_context *find_conversation_internal(int conversation_id)
 {
     struct conversation_context *ctx;
 
@@ -599,3 +599,4 @@ EXPORT_SYMBOL(context_get_stats);
 EXPORT_SYMBOL(context_management_init);
 EXPORT_SYMBOL(context_management_cleanup);
 EXPORT_SYMBOL(context_management_initialized);
+EXPORT_SYMBOL(find_conversation_internal);
