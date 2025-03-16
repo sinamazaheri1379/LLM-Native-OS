@@ -396,14 +396,14 @@ static int select_fifo(struct llm_request *req, struct scheduler_state *state)
     if (state->fifo.count > 0) {
         /* Get the next provider from the queue */
         provider = state->fifo.providers[state->fifo.head];
-        state->fifo.head = (state->fifo.head + 1) % FIFO_QUEUE_SIZE;
+        state->fifo.head = (state->fifo.head + 1) % MAX_FIFO_QUEUE_SIZE;
         state->fifo.count--;
         found = true;
 
         /* Re-add the provider to the queue for round-robin behavior */
-        if (state->fifo.count < FIFO_QUEUE_SIZE) {
+        if (state->fifo.count < MAX_FIFO_QUEUE_SIZE) {
             state->fifo.providers[state->fifo.tail] = provider;
-            state->fifo.tail = (state->fifo.tail + 1) % FIFO_QUEUE_SIZE;
+            state->fifo.tail = (state->fifo.tail + 1) % MAX_FIFO_QUEUE_SIZE;
             state->fifo.count++;
         }
     }
@@ -418,9 +418,9 @@ static int select_fifo(struct llm_request *req, struct scheduler_state *state)
         spin_lock_irqsave(&state->fifo.lock, flags);
 
         for (i = 0; i < PROVIDER_COUNT; i++) {
-            if (is_provider_available(i, state) && state->fifo.count < FIFO_QUEUE_SIZE) {
+            if (is_provider_available(i, state) && state->fifo.count < MAX_FIFO_QUEUE_SIZE) {
                 state->fifo.providers[state->fifo.tail] = i;
-                state->fifo.tail = (state->fifo.tail + 1) % FIFO_QUEUE_SIZE;
+                state->fifo.tail = (state->fifo.tail + 1) % MAX_FIFO_QUEUE_SIZE;
                 state->fifo.count++;
             }
         }
@@ -428,14 +428,14 @@ static int select_fifo(struct llm_request *req, struct scheduler_state *state)
         /* If any providers were added, get the first one */
         if (state->fifo.count > 0) {
             provider = state->fifo.providers[state->fifo.head];
-            state->fifo.head = (state->fifo.head + 1) % FIFO_QUEUE_SIZE;
+            state->fifo.head = (state->fifo.head + 1) % MAX_FIFO_QUEUE_SIZE;
             state->fifo.count--;
             found = true;
 
             /* Re-add the provider for round-robin */
-            if (state->fifo.count < FIFO_QUEUE_SIZE) {
+            if (state->fifo.count < MAX_FIFO_QUEUE_SIZE) {
                 state->fifo.providers[state->fifo.tail] = provider;
-                state->fifo.tail = (state->fifo.tail + 1) % FIFO_QUEUE_SIZE;
+                state->fifo.tail = (state->fifo.tail + 1) % MAX_FIFO_QUEUE_SIZE;
                 state->fifo.count++;
             }
         }
@@ -612,7 +612,7 @@ void update_provider_metrics(int provider, int result, s64 latency_ms, int token
     bool should_adjust = false;
 
     /* Get state from current task */
-    state = current->scheduler_data;
+    state = get_scheduler_state();
 
     if (!state || provider < 0 || provider >= PROVIDER_COUNT) {
         pr_err("update_provider_metrics: Invalid state or provider\n");
@@ -888,39 +888,6 @@ void scheduler_reset_metrics(struct scheduler_state *state)
 }
 
 /*
- * Store scheduler state in task_struct with safety checks
- * Properly validates input to prevent corruption
- */
-void set_scheduler_state(struct scheduler_state *state)
-{
-    if (!state) {
-        pr_err("set_scheduler_state: Invalid state pointer\n");
-        return;
-    }
-
-    if (!current) {
-        pr_err("set_scheduler_state: No current task\n");
-        return;
-    }
-
-    current->scheduler_data = state;
-}
-
-/*
- * Get scheduler state from task_struct with safety checks
- * Returns the scheduler state or NULL if not available
- */
-struct scheduler_state *get_scheduler_state(void)
-{
-    if (!current) {
-        pr_err("get_scheduler_state: No current task\n");
-        return NULL;
-    }
-
-    return current->scheduler_data;
-}
-
-/*
  * Initialize the FIFO queue
  * Properly sets up a new queue or resets an existing one
  */
@@ -964,11 +931,11 @@ int fifo_add_provider(struct fifo_queue *fifo, int provider)
 
     spin_lock_irqsave(&fifo->lock, flags);
 
-    if (fifo->count >= FIFO_QUEUE_SIZE) {
+    if (fifo->count >= MAX_FIFO_QUEUE_SIZE) {
         ret = -ENOSPC;
     } else {
         fifo->providers[fifo->tail] = provider;
-        fifo->tail = (fifo->tail + 1) % FIFO_QUEUE_SIZE;
+        fifo->tail = (fifo->tail + 1) % MAX_FIFO_QUEUE_SIZE;
         fifo->count++;
     }
 

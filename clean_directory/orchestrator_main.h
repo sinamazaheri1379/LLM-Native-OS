@@ -7,7 +7,7 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
-
+#include <linux/device.h>
 /* Constants for buffer sizes, error codes */
 #define DRIVER_VERSION "2.0"
 #define MAX_PROMPT_LENGTH 4096
@@ -102,7 +102,8 @@ struct provider_metrics {
 };
 
 struct fifo_queue {
-    struct llm_request requests[MAX_FIFO_QUEUE_SIZE];
+    int providers[MAX_FIFO_QUEUE_SIZE];  // Add this line
+    struct llm_request requests[MAX_FIFO_QUEUE_SIZE]; // Keep this if needed
     int head;
     int tail;
     int count;
@@ -119,6 +120,10 @@ struct scheduler_state {
     bool auto_adjust;
 };
 
+
+/* FIFO queue functions */
+void fifo_init(struct fifo_queue *fifo);
+int fifo_add_provider(struct fifo_queue *fifo, int provider);
 /* Function declarations for all components */
 /* Context management functions */
 int context_add_entry(int conversation_id, const char *role, const char *content);
@@ -175,8 +180,46 @@ int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_
 int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct llm_response *resp);
 const char *get_default_model(int provider);
 bool is_model_supported(int provider, const char *model_name);
-
+void remove_scheduler_state(void);
 
 struct scheduler_state *get_scheduler_state(void);
-static struct conversation_context *find_conversation(int conversation_id);
+struct conversation_context *find_conversation(int conversation_id);
+struct conversation_context *find_conversation_internal(int conversation_id);
+/* Memory management subsystem functions */
+int memory_management_init(void);
+void memory_management_cleanup(void);
+bool memory_management_initialized(void);
+
+/* JSON manager subsystem functions */
+int json_manager_init(void);
+void json_manager_cleanup(void);
+
+/* Context management subsystem functions */
+int context_management_init(void);
+void context_management_cleanup(void);
+void context_get_stats(int *total_conversations, int *total_entries,
+                      int *entries_added_count, int *entries_pruned_count);
+
+/* Network subsystem functions */
+int network_init(void);
+void network_cleanup(void);
+
+/* TLS subsystem functions */
+int tls_init(void);
+void tls_cleanup(void);
+/* JSON manager additional functions */
+bool json_manager_initialized_check(void);
+int json_buffer_resize(struct llm_json_buffer *buf, size_t new_size);
+bool validate_json(const char *json);
+int extract_response_content_improved(const char *json, char *output, size_t output_size);
+void json_get_stats(int *buffers_created_count, int *buffers_resized_count,
+                    int *parse_attempts_count, int *parse_successes_count);
+ssize_t json_stats_show(struct device *dev, struct device_attribute *attr, char *buf);
+/* Memory statistics functions */
+ssize_t memory_stats_show(struct device *dev, struct device_attribute *attr, char *buf);
+ssize_t memory_limits_show(struct device *dev, struct device_attribute *attr, char *buf);
+ssize_t memory_limits_store(struct device *dev, struct device_attribute *attr,
+                          const char *buf, size_t count);
+ssize_t context_stats_show(struct device *dev, struct device_attribute *attr, char *buf);
+bool context_management_initialized(void);
 #endif /* ORCHESTRATOR_MAIN_H */

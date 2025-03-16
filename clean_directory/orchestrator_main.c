@@ -530,9 +530,9 @@ int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_
 int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
     char *gemini_host = "104.18.6.14";  /* Google Gemini API IP - would use DNS in real implementation */
+    struct llm_json_buffer json_buf;
     int port = 443;
     char *path = "/v1/models/gemini-pro:generateContent";  /* Path will include API key */
-    struct llm_json_buffer json_buf;
     int ret;
     char auth_path[256];
     const char *model;
@@ -577,7 +577,6 @@ int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct 
 
     /* Add conversation context if available - Gemini has a different format */
     if (req->conversation_id > 0) {
-        struct llm_json_buffer context_buf;
         struct context_entry *entry;
         unsigned long flags;
         struct conversation_context *ctx;
@@ -729,13 +728,13 @@ static int set_api_key(int provider, const char *key)
 }
 
 /* Function to safely get API key without exposing it */
-static const char *get_api_key(int provider)
-{
-    if (provider < 0 || provider >= 3)
-        return NULL;
-
-    return secure_api_keys[provider];
-}
+//static const char *get_api_key(int provider)
+//{
+//    if (provider < 0 || provider >= 3)
+//        return NULL;
+//
+//    return secure_api_keys[provider];
+//}
 
 /* Clear all API keys securely */
 static void clear_all_api_keys(void)
@@ -863,70 +862,77 @@ static int orchestrator_release(struct inode *inode, struct file *file)
 
 static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
 {
-    struct llm_request req;
+    struct llm_request* req;
     int ret;
 
-    if (count != sizeof(struct llm_request))
+    if (count != sizeof(struct llm_request)){
         return -EINVAL;
-
-    if (copy_from_user(&req, buf, sizeof(req)))
+    }
+	req = kmalloc(sizeof(struct llm_request), GFP_KERNEL);
+    if (!req){
+        return -ENOMEM;
+    }
+    if (copy_from_user(req, buf, sizeof(*req))) {
+        kfree(req);
         return -EFAULT;
+    }
 
     /* Comprehensive input validation */
-    if (req.conversation_id <= 0) {
-        pr_err("orchestrator_write: Invalid conversation_id: %d\n", req.conversation_id);
+    if (req->conversation_id <= 0) {
+        pr_err("orchestrator_write: Invalid conversation_id: %d\n", req->conversation_id);
         return -EINVAL;
     }
 
     /* Validate prompt - ensure it's not empty and is null-terminated */
-    if (req.prompt[0] == '\0') {
+    if (req->prompt[0] == '\0') {
         pr_err("orchestrator_write: Empty prompt\n");
         return -EINVAL;
     }
-    req.prompt[MAX_PROMPT_LENGTH - 1] = '\0';
+    req->prompt[MAX_PROMPT_LENGTH - 1] = '\0';
 
     /* Validate role - use default if empty */
-    if (req.role[0] == '\0') {
-        strscpy(req.role, "user", MAX_ROLE_NAME);
+    if (req->role[0] == '\0') {
+        strscpy(req->role, "user", MAX_ROLE_NAME);
     } else {
-        req.role[MAX_ROLE_NAME - 1] = '\0';
+        req->role[MAX_ROLE_NAME - 1] = '\0';
     }
 
     /* Validate model name - if empty, we'll use a default in the provider code */
-    req.model_name[MAX_MODEL_NAME - 1] = '\0';
+    req->model_name[MAX_MODEL_NAME - 1] = '\0';
 
     /* Validate and set reasonable defaults for numeric parameters */
-    if (req.max_tokens <= 0 || req.max_tokens > 32000) {
-        req.max_tokens = 4000; /* Reasonable default */
+    if (req->max_tokens <= 0 || req->max_tokens > 32000) {
+        req->max_tokens = 4000; /* Reasonable default */
     }
 
-    if (req.temperature_x100 <= 0 || req.temperature_x100 > 200) {
-        req.temperature_x100 = 70; /* Default to 0.7 */
+    if (req->temperature_x100 <= 0 || req->temperature_x100 > 200) {
+        req->temperature_x100 = 70; /* Default to 0.7 */
     }
 
-    if (req.timeout_ms <= 0) {
-        req.timeout_ms = 30000; /* 30 seconds default */
-    } else if (req.timeout_ms > 300000) {
-        req.timeout_ms = 300000; /* Cap at 5 minutes */
+    if (req->timeout_ms <= 0) {
+        req->timeout_ms = 30000; /* 30 seconds default */
+    } else if (req->timeout_ms > 300000) {
+        req->timeout_ms = 300000; /* Cap at 5 minutes */
     }
 
     /* Validate scheduler algorithm */
-    if (req.scheduler_algorithm != -1 && (req.scheduler_algorithm < 0 || req.scheduler_algorithm > SCHEDULER_MAX_ALGORITHM)) {
+    if (req->scheduler_algorithm != -1 && (req->scheduler_algorithm < 0 || req->scheduler_algorithm > SCHEDULER_MAX_ALGORITHM)) {
         pr_warn("orchestrator_write: Invalid scheduler algorithm: %d, using default\n",
-        req.scheduler_algorithm);
-        req.scheduler_algorithm = -1; /* Use default from state */
+        req->scheduler_algorithm);
+        req->scheduler_algorithm = -1; /* Use default from state */
     }
 
     /* Validate priority */
-    if (req.priority < 0) {
-        req.priority = 0;
-    } else if (req.priority > 100) {
-        req.priority = 100;
+    if (req->priority < 0) {
+        req->priority = 0;
+    } else if (req->priority > 100) {
+        req->priority = 100;
     }
 
     mutex_lock(&orchestrator_mutex);
-    ret = orchestrate_request(&req, &global_response);
+    ret = orchestrate_request(req, &global_response);
     mutex_unlock(&orchestrator_mutex);
+    kfree(req);
     return ret < 0 ? ret : count;
 }
 
@@ -958,6 +964,33 @@ static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t cou
     return ret;
 }
 /* Shows current scheduler algorithm */
+ssize_t memory_stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    size_t total_used, max_total;
+    int conversation_count, max_conversations;
+
+    context_get_memory_stats(&total_used, &max_total, &conversation_count, &max_conversations);
+
+    return scnprintf(buf, PAGE_SIZE,
+                   "Memory Usage:\n"
+                   "  Total Used: %zu bytes\n"
+                   "  Maximum Allowed: %zu bytes\n"
+                   "  Active Conversations: %d / %d\n",
+                   total_used, max_total, conversation_count, max_conversations);
+}
+
+ssize_t memory_limits_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    // Add implementation
+    return scnprintf(buf, PAGE_SIZE, "Memory limits information\n");
+}
+
+ssize_t memory_limits_store(struct device *dev, struct device_attribute *attr,
+                              const char *buf, size_t count)
+{
+    // Add implementation
+    return count;
+}
 static ssize_t scheduler_algorithm_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
     int algorithm = atomic_read(&global_scheduler.current_algorithm);
@@ -1143,7 +1176,7 @@ static ssize_t fifo_status_show(struct device *dev, struct device_attribute *att
 
     len += scnprintf(buf + len, PAGE_SIZE - len, "FIFO Queue Status:\n");
     len += scnprintf(buf + len, PAGE_SIZE - len, "  Queue Size: %d/%d\n",
-                    global_scheduler.fifo.count, FIFO_QUEUE_SIZE);
+                    global_scheduler.fifo.count, MAX_FIFO_QUEUE_SIZE);
     len += scnprintf(buf + len, PAGE_SIZE - len, "  Head: %d\n", global_scheduler.fifo.head);
     len += scnprintf(buf + len, PAGE_SIZE - len, "  Tail: %d\n", global_scheduler.fifo.tail);
 
@@ -1296,7 +1329,7 @@ static int __init orchestrator_init(void)
 
     /* Step 9: Create device class and device */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-    orchestrator_class = class_create(THIS_MODULE, MODULE_NAME);
+    orchestrator_class = class_create(MODULE_NAME);
 #else
     orchestrator_class = class_create(MODULE_NAME);
 #endif
