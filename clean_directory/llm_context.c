@@ -41,13 +41,18 @@ struct conversation_context *find_conversation_internal(int conversation_id)
     return NULL;
 }
 
+struct conversation_context *find_conversation(int conversation_id)
+{
+    return find_conversation_internal(conversation_id);
+}
+
 /* Create a new conversation context */
 static struct conversation_context *create_conversation(int conversation_id)
 {
     struct conversation_context *ctx;
 
     /* Check if memory management is initialized */
-    if (!memory_management_initialized()) {
+    if (!memory_management_init()) {
         pr_warn("create_conversation: Memory management not initialized\n");
         return NULL;
     }
@@ -600,3 +605,4 @@ EXPORT_SYMBOL(context_management_init);
 EXPORT_SYMBOL(context_management_cleanup);
 EXPORT_SYMBOL(context_management_initialized);
 EXPORT_SYMBOL(find_conversation_internal);
+EXPORT_SYMBOL(find_conversation);

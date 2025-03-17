@@ -158,7 +158,6 @@ static int tls_sw_fallback_send(struct socket *sock, void *data, size_t len)
 {
     struct msghdr msg = {0};
     struct kvec iov;
-    int ret;
     struct tls_state *state;
 
     if (!sock || !sock->sk || !data || len == 0)
@@ -242,7 +241,6 @@ static int tls_sw_fallback_recv(struct socket *sock, void *data, size_t len, int
 {
     struct msghdr msg = {0};
     struct kvec iov;
-    int ret;
     struct tls_state *state;
 
     if (!sock || !sock->sk || !data || len == 0)

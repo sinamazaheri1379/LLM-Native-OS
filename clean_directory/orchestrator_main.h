@@ -41,6 +41,12 @@
 #define SCHEDULER_MAX_ALGORITHM SCHEDULER_FIFO
 /* Data structures for requests, responses, contexts */
 extern spinlock_t conversations_lock;
+/* Request timeout handling */
+struct request_timeout_data {
+    struct socket *sock;
+    struct timer_list timer;
+    atomic_t *completed_flag;
+};
 struct llm_json_buffer {
     char *data;
     size_t size;
@@ -222,4 +228,8 @@ ssize_t memory_limits_store(struct device *dev, struct device_attribute *attr,
                           const char *buf, size_t count);
 ssize_t context_stats_show(struct device *dev, struct device_attribute *attr, char *buf);
 bool context_management_initialized(void);
+
+/* Add to orchestrator_main.h */
+int tls_send(struct socket *sock, void *data, size_t len);
+int tls_recv(struct socket *sock, void *data, size_t len, int flags);
 #endif /* ORCHESTRATOR_MAIN_H */

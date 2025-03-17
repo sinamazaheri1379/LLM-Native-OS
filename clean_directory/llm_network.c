@@ -12,6 +12,9 @@
 #include <linux/ctype.h>
 #include <linux/slab.h>
 #include <linux/timer.h>
+#include <net/tcp.h>       /* For TCP_NODELAY */
+#include <linux/delay.h>
+#include <linux/sockptr.h>
 #include "orchestrator_main.h"
 
 #define MAX_HEADER_SIZE 2048
@@ -63,12 +66,7 @@ extern void cleanup_tls(struct socket *sock);
 extern int tls_send(struct socket *sock, void *data, size_t len);
 extern int tls_recv(struct socket *sock, void *data, size_t len, int flags);
 
-/* Request timeout handling */
-struct request_timeout_data {
-    struct socket *sock;
-    struct timer_list timer;
-    atomic_t *completed_flag;
-};
+
 
 /* Custom case-insensitive search function as a replacement for strcasestr */
 static int case_insensitive_search(const char *haystack, const char *needle)
@@ -361,13 +359,13 @@ int establish_connection(struct socket **sock, const char *host_ip,
     /* Set socket options for better reliability */
     {
         int val = 1;
-        ret = kernel_setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char *)&val, sizeof(val));
+		ret = sock_setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, KERNEL_SOCKPTR(&val), sizeof(val));
         if (ret < 0) {
             pr_warn("establish_connection: Failed to set SO_KEEPALIVE: %d\n", ret);
             /* Not fatal, continue */
         }
 
-        ret = kernel_setsockopt(s, SOL_TCP, TCP_NODELAY, (char *)&val, sizeof(val));
+        ret = sock_setsockopt(s, IPPROTO_TCP, TCP_NODELAY, KERNEL_SOCKPTR(&val), sizeof(val));
         if (ret < 0) {
             pr_warn("establish_connection: Failed to set TCP_NODELAY: %d\n", ret);
             /* Not fatal, continue */
@@ -402,8 +400,6 @@ int establish_connection(struct socket **sock, const char *host_ip,
 static int send_all(struct socket *sock, void *data, size_t len, bool use_tls)
 {
     size_t sent = 0;
-    int ret;
-
     while (sent < len) {
         int this_sent;
 
@@ -534,20 +530,19 @@ int network_send_request(const char *host_ip, int port,
     /* Set socket timeout */
     {
         long timeout_jiffies = msecs_to_jiffies(timeout_ms);
-        ret = sock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-                              (char *)&timeout_jiffies, sizeof(timeout_jiffies));
-        if (ret < 0) {
-            pr_warn("network_send_request: Failed to set socket timeout: %d\n", ret);
-            /* Non-fatal, continue with default timeout */
-        }
+        #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+    	ret = sock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO_NEW,
+                         KERNEL_SOCKPTR(&timeout_jiffies), sizeof(timeout_jiffies));
 
-        /* Also set send timeout */
-        ret = sock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
-                              (char *)&timeout_jiffies, sizeof(timeout_jiffies));
-        if (ret < 0) {
-            pr_warn("network_send_request: Failed to set send timeout: %d\n", ret);
-            /* Non-fatal, continue with default timeout */
-        }
+    	ret = sock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO_NEW,
+                         KERNEL_SOCKPTR(&timeout_jiffies), sizeof(timeout_jiffies));
+		#else
+    	ret = kernel_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                           (char *)&timeout_jiffies, sizeof(timeout_jiffies));
+
+    	ret = kernel_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+                           (char *)&timeout_jiffies, sizeof(timeout_jiffies));
+		#endif
     }
 
     /* Setup overall request timeout */

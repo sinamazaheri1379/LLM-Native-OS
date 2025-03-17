@@ -1,0 +1,1 @@
+savedcmd_/home/sina-mazaheri/CLionProjects/LLM-Native-OS/clean_directory/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/sina-mazaheri/CLionProjects/LLM-Native-OS/clean_directory/Module.symvers -T /home/sina-mazaheri/CLionProjects/LLM-Native-OS/clean_directory/modules.order -i Module.symvers -e 

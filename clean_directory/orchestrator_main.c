@@ -963,34 +963,6 @@ static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t cou
     mutex_unlock(&orchestrator_mutex);
     return ret;
 }
-/* Shows current scheduler algorithm */
-ssize_t memory_stats_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    size_t total_used, max_total;
-    int conversation_count, max_conversations;
-
-    context_get_memory_stats(&total_used, &max_total, &conversation_count, &max_conversations);
-
-    return scnprintf(buf, PAGE_SIZE,
-                   "Memory Usage:\n"
-                   "  Total Used: %zu bytes\n"
-                   "  Maximum Allowed: %zu bytes\n"
-                   "  Active Conversations: %d / %d\n",
-                   total_used, max_total, conversation_count, max_conversations);
-}
-
-ssize_t memory_limits_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    // Add implementation
-    return scnprintf(buf, PAGE_SIZE, "Memory limits information\n");
-}
-
-ssize_t memory_limits_store(struct device *dev, struct device_attribute *attr,
-                              const char *buf, size_t count)
-{
-    // Add implementation
-    return count;
-}
 static ssize_t scheduler_algorithm_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
     int algorithm = atomic_read(&global_scheduler.current_algorithm);

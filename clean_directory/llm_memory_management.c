@@ -594,3 +594,6 @@ EXPORT_SYMBOL(context_allocate_entry);
 EXPORT_SYMBOL(context_free_entry);
 EXPORT_SYMBOL(memory_management_init);
 EXPORT_SYMBOL(memory_management_cleanup);
+EXPORT_SYMBOL(memory_stats_show);
+EXPORT_SYMBOL(memory_limits_show);
+EXPORT_SYMBOL(memory_limits_store);

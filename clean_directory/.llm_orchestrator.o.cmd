@@ -1,0 +1,1 @@
+savedcmd_/home/sina-mazaheri/CLionProjects/LLM-Native-OS/clean_directory/llm_orchestrator.o := ld -m elf_x86_64 -z noexecstack --no-warn-rwx-segments   -r -o /home/sina-mazaheri/CLionProjects/LLM-Native-OS/clean_directory/llm_orchestrator.o @/home/sina-mazaheri/CLionProjects/LLM-Native-OS/clean_directory/llm_orchestrator.mod 
