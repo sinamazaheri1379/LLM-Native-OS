@@ -727,15 +727,6 @@ static int set_api_key(int provider, const char *key)
     return 0;
 }
 
-/* Function to safely get API key without exposing it */
-//static const char *get_api_key(int provider)
-//{
-//    if (provider < 0 || provider >= 3)
-//        return NULL;
-//
-//    return secure_api_keys[provider];
-//}
-
 /* Clear all API keys securely */
 static void clear_all_api_keys(void)
 {

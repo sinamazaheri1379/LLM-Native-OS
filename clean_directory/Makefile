@@ -55,27 +55,27 @@ uninstall:
 # Load module with API keys
 .PHONY: load
 load:
-	@if [ -z "$(OPENAI_KEY)" ] || [ -z "$(ANTHROPIC_KEY)" ] || [ -z "$(GEMINI_KEY)" ]; then \
+	@if [ -z "$(OPENAI_API_KEY)" ] || [ -z "$(ANTHROPIC_API_KEY)" ] || [ -z "$(GEMINI_API_KEY)" ]; then \
 		echo "Error: You must set OPENAI_KEY, ANTHROPIC_KEY, and GEMINI_KEY environment variables."; \
 		echo "Example: OPENAI_KEY=sk-xxx ANTHROPIC_KEY=sk-ant-xxx GEMINI_KEY=xxxx make load"; \
 		exit 1; \
 	fi
-	insmod $(MODULE_NAME).ko openai_api_key="$(OPENAI_KEY)" anthropic_api_key="$(ANTHROPIC_KEY)" \
-		google_gemini_api_key="$(GEMINI_KEY)" prune_threshold_mins=60
+	sudo insmod $(MODULE_NAME).ko openai_api_key="$(OPENAI_API_KEY)" anthropic_api_key="$(ANTHROPIC_API_KEY)" \
+		google_gemini_api_key="$(GEMINI_API_KEY)" prune_threshold_mins=60
 	@echo "Module loaded with API keys"
 	@if [ -e "/proc/modules" ] && grep -q $(MODULE_NAME) /proc/modules; then \
 		echo "Success: Module loaded correctly"; \
-		dmesg | tail -n 20 | grep -i "$(MODULE_NAME)"; \
+		sudo dmesg | tail -n 20 | grep -i "$(MODULE_NAME)"; \
 	else \
 		echo "Error: Module failed to load"; \
-		dmesg | tail -n 20; \
+		sudo dmesg | tail -n 20; \
 	fi
 
 # Unload module
 .PHONY: unload
 unload:
-	@if lsmod | grep -q $(MODULE_NAME); then \
-		rmmod $(MODULE_NAME); \
+	@if sudo lsmod | grep -q $(MODULE_NAME); then \
+		sudo rmmod $(MODULE_NAME); \
 		echo "Module unloaded"; \
 	else \
 		echo "Module not loaded"; \
