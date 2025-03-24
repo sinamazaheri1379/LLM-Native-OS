@@ -227,7 +227,7 @@ void remove_scheduler_state(void)
 /* OpenAI API implementation */
 int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
-    char *openai_host = "104.18.6.192";  /* OpenAI API IP - would use DNS in real implementation */
+    char *openai_host = "api.openai.com";  /* OpenAI API IP - would use DNS in real implementation */
     int port = 443;
     char *path = "/v1/chat/completions";
     struct llm_json_buffer json_buf;
@@ -378,7 +378,7 @@ int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_res
 /* Anthropic API implementation */
 int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
-    char *anthropic_host = "104.18.6.119";  /* Anthropic API IP - would use DNS in real implementation */
+    char *anthropic_host = "api.anthropic.com";  /* Anthropic API IP - would use DNS in real implementation */
     int port = 443;
     char *path = "/v1/messages";
     struct llm_json_buffer json_buf;
@@ -529,7 +529,7 @@ int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_
 /* Google Gemini API implementation */
 int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
-    char *gemini_host = "104.18.6.14";  /* Google Gemini API IP - would use DNS in real implementation */
+    char *gemini_host = "generativelanguage.googleapis.com";  /* Google Gemini API IP - would use DNS in real implementation */
     struct llm_json_buffer json_buf;
     int port = 443;
     char *path = "/v1/models/gemini-pro:generateContent";  /* Path will include API key */

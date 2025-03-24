@@ -15,6 +15,7 @@
 #include <net/tcp.h>       /* For TCP_NODELAY */
 #include <linux/delay.h>
 #include <linux/sockptr.h>
+#include <net/netlink.h>
 #include "orchestrator_main.h"
 
 #define MAX_HEADER_SIZE 2048
@@ -32,7 +33,8 @@ static bool is_response_complete(const char *buf, int len);
 static int parse_http_status(const char *buf);
 static bool extract_header_value(const char *response, const char *header_name,
                                  char *value, size_t value_size);
-
+static bool is_domain_name(const char *host);
+static bool is_host_valid(const char *host);
 /* Fix 3: Improved locking in request_timeout_callback() in llm_network.c */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
 static void request_timeout_callback(struct timer_list *t)
@@ -98,7 +100,7 @@ static int case_insensitive_search(const char *haystack, const char *needle)
     return 0;
 }
 
-/* Validate IP address format */
+//* Keep the original is_ip_address_valid function for IP validation */
 static bool is_ip_address_valid(const char *ip)
 {
     int octets[4];
@@ -318,23 +320,52 @@ static bool extract_header_value(const char *response, const char *header_name,
 
     return true;
 }
+/* Add a new function to validate hosts (either IPs or domain names) */
+static bool is_host_valid(const char *host)
+{
+    const char *p;
+    size_t len;
+    int dots = 0;
+    bool has_alpha = false;
 
-/* Establish a TCP connection to a remote server */
-int establish_connection(struct socket **sock, const char *host_ip,
+    if (!host)
+        return false;
+
+    len = strlen(host);
+    if (len < 1 || len > MAX_IP_LENGTH)
+        return false;
+
+    /* First check if it's a valid IP address */
+    if (is_ip_address_valid(host))
+        return true;
+
+    /* Not an IP, check if it could be a valid domain name */
+    for (p = host; *p; p++) {
+        if (isalpha(*p))
+            has_alpha = true;
+        else if (*p == '.')
+            dots++;
+        else if (!isdigit(*p) && *p != '-' && *p != '_')
+            return false; /* Invalid character for hostname */
+    }
+
+    /* Basic validation: at least one letter, at least one dot */
+    return has_alpha && dots > 0;
+}
+/* Establish a TCP connection to a remote server with DNS resolution */
+int establish_connection(struct socket **sock, const char *host,
                          int port, bool use_tls)
 {
     struct socket *s;
     struct sockaddr_in server_addr;
     int ret;
+    bool is_ip;
 
-    if (!sock || !host_ip || port <= 0 || port > 65535)
+    if (!sock || !host || port <= 0 || port > 65535)
         return -EINVAL;
 
-    /* Validate IP address */
-    if (!is_ip_address_valid(host_ip)) {
-        pr_err("establish_connection: Invalid IP address format: %s\n", host_ip);
-        return -EINVAL;
-    }
+    /* Check if the host is an IP address or a domain name */
+    is_ip = is_ip_address_valid(host);
 
     /* Create a TCP socket */
     ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &s);
@@ -343,23 +374,71 @@ int establish_connection(struct socket **sock, const char *host_ip,
         return ret;
     }
 
-    /* Prepare server address */
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
 
-    /* Convert IP string to binary */
-    ret = in4_pton(host_ip, -1, (u8 *)&server_addr.sin_addr.s_addr, -1, NULL);
-    if (!ret) {
-        pr_err("establish_connection: IP address conversion failed: %s\n", host_ip);
+    if (is_ip) {
+        /* Convert IP string to binary */
+        ret = in4_pton(host, -1, (u8 *)&server_addr.sin_addr.s_addr, -1, NULL);
+        if (!ret) {
+            pr_err("establish_connection: IP address conversion failed: %s\n", host);
+            sock_release(s);
+            return -EINVAL;
+        }
+    } else {
+        /* This is a domain name, use kernel DNS resolution */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
+        struct addrinfo hints = { 0 };
+        struct addrinfo *res = NULL;
+        int retries = 3; /* Retry DNS resolution a few times if it fails */
+
+        hints.ai_family = AF_INET; /* IPv4 only for now */
+        hints.ai_socktype = SOCK_STREAM;
+
+        pr_info("establish_connection: Resolving domain name: %s\n", host);
+
+        while (retries > 0) {
+            ret = kernel_getaddrinfo(host, NULL, &hints, &res);
+            if (ret == 0 && res != NULL)
+                break;
+
+            pr_warn("establish_connection: DNS resolution attempt failed for %s: %d, retries left: %d\n",
+                    host, ret, retries - 1);
+            retries--;
+            msleep(100); /* Small delay before retry */
+        }
+
+        if (ret != 0 || res == NULL) {
+            pr_err("establish_connection: DNS resolution failed for %s: %d\n", host, ret);
+            sock_release(s);
+            return ret != 0 ? ret : -ENOENT;
+        }
+
+        /* Copy the resolved IP address */
+        memcpy(&server_addr, res->ai_addr, sizeof(struct sockaddr_in));
+
+        /* Log the resolved IP for debugging */
+        {
+            char ip_buf[INET_ADDRSTRLEN];
+            sprintf(ip_buf, "%pI4", &server_addr.sin_addr.s_addr);
+            pr_info("establish_connection: Resolved %s to %s\n", host, ip_buf);
+        }
+
+        /* Free the address info */
+        kernel_freeaddrinfo(res);
+#else
+        /* Kernel doesn't support DNS resolution */
+        pr_err("establish_connection: Kernel version doesn't support DNS resolution. Use IP address.\n");
         sock_release(s);
-        return -EINVAL;
+        return -ENOTSUPP;
+#endif
     }
 
     /* Set socket options for better reliability */
     {
         int val = 1;
-		ret = sock_setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, KERNEL_SOCKPTR(&val), sizeof(val));
+        ret = sock_setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, KERNEL_SOCKPTR(&val), sizeof(val));
         if (ret < 0) {
             pr_warn("establish_connection: Failed to set SO_KEEPALIVE: %d\n", ret);
             /* Not fatal, continue */
@@ -376,7 +455,7 @@ int establish_connection(struct socket **sock, const char *host_ip,
     ret = kernel_connect(s, (struct sockaddr *)&server_addr, sizeof(server_addr), 0);
     if (ret < 0) {
         pr_err("establish_connection: kernel_connect failed: %d to %s:%d\n",
-               ret, host_ip, port);
+               ret, host, port);
         sock_release(s);
         return ret;
     }
@@ -395,6 +474,12 @@ int establish_connection(struct socket **sock, const char *host_ip,
     return 0;
 }
 
+/* Helper function to determine if a string is a domain name or IP address */
+static bool is_domain_name(const char *host)
+{
+    /* If it's a valid IP address, it's not a domain name */
+    return !is_ip_address_valid(host);
+}
 
 /* Fix 2: Correctly handle partial sends/receives in llm_network.c */
 static int send_all(struct socket *sock, void *data, size_t len, bool use_tls)
