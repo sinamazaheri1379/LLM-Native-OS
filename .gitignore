@@ -20,3 +20,60 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+#
+# Kernel Module Specific
+*.ko
+*.o
+*.o.d
+*.o.cmd
+*.ko.cmd
+*.mod
+*.mod.cmd
+*.mod.o.cmd
+*.mod.c
+*.mod.o
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+modules.builtin
+
+# Test Applications
+tests/test_basic
+tests/test_perf
+tests/test_providers
+tests/test_errors
+tests/llm_client
+tests/test_app
+
+# Documentation
+doc/
+Doxyfile
+
+# Debug Info
+*.symvers
+*.markers
+
+# Editor Files
+*~
+.*.swp
+.*.swo
+*.bak
+.vscode/
+.idea/
+*.sublime-*
+
+# Build Artifacts
+*.a
+*.la
+*.lo
+*.so
+*.so.*
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Dependencies
+.depend
+.depfile

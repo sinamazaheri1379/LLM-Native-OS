@@ -72,6 +72,20 @@ struct scheduler_registry_entry {
     atomic_t in_use;
 };
 
+/* In orchestrator_main.c, add the provider configurations */
+struct llm_provider_config provider_configs[PROVIDER_COUNT] = {
+    { "api.openai.com", "127.0.0.1", 8080, "/v1/chat/completions" },      /* OpenAI */
+    { "api.anthropic.com", "127.0.0.1", 8080, "/v1/messages" },           /* Anthropic */
+    { "generativelanguage.googleapis.com", "127.0.0.1", 8080, "/v1/models/gemini-pro:generateContent" } /* Gemini */
+};
+
+/* Function to get provider configuration */
+struct llm_provider_config *get_provider_config(int provider_id) {
+    if (provider_id >= 0 && provider_id < PROVIDER_COUNT)
+        return &provider_configs[provider_id];
+    return NULL;
+}
+
 static struct scheduler_registry_entry scheduler_registry[MAX_SCHEDULER_REGISTRY];
 static DEFINE_SPINLOCK(scheduler_registry_lock);
 static atomic_t registry_initialized = ATOMIC_INIT(0);
@@ -224,12 +238,74 @@ void remove_scheduler_state(void)
 
     spin_unlock(&scheduler_registry_lock);
 }
+static ssize_t provider_host_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    ssize_t len = 0;
+    int i;
+
+    len += scnprintf(buf + len, PAGE_SIZE - len, "Provider Host Configurations:\n");
+
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        len += scnprintf(buf + len, PAGE_SIZE - len,
+                      "%d: %s => %s:%d, path: %s\n",
+                      i, provider_configs[i].domain_name,
+                      provider_configs[i].host_ip,
+                      provider_configs[i].port,
+                      provider_configs[i].path);
+    }
+
+    return len;
+}
+
+static ssize_t provider_host_store(struct device *dev, struct device_attribute *attr,
+                                 const char *buf, size_t count)
+{
+    int provider, port;
+    char ip[MAX_IP_LENGTH];
+
+    if (sscanf(buf, "%d,%[^,],%d", &provider, ip, &port) != 3) {
+        pr_err("provider_host_store: Invalid format, expected: provider_id,ip,port\n");
+        return -EINVAL;
+    }
+
+    if (provider < 0 || provider >= PROVIDER_COUNT) {
+        pr_err("provider_host_store: Invalid provider ID: %d\n", provider);
+        return -EINVAL;
+    }
+
+    if (!is_ip_address_valid(ip)) {
+        pr_err("provider_host_store: Invalid IP address: %s\n", ip);
+        return -EINVAL;
+    }
+
+    if (port <= 0 || port > 65535) {
+        pr_err("provider_host_store: Invalid port: %d\n", port);
+        return -EINVAL;
+    }
+
+    /* Update the configuration */
+    mutex_lock(&orchestrator_mutex);
+
+    strncpy(provider_configs[provider].host_ip, ip, MAX_IP_LENGTH - 1);
+    provider_configs[provider].host_ip[MAX_IP_LENGTH - 1] = '\0';
+    provider_configs[provider].port = port;
+
+    mutex_unlock(&orchestrator_mutex);
+
+    pr_info("Updated provider %d (%s) to use IP: %s, port: %d\n",
+            provider, provider_configs[provider].domain_name, ip, port);
+
+    return count;
+}
+
+
 /* OpenAI API implementation */
 int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
-    char *openai_host = "api.openai.com";  /* OpenAI API IP - would use DNS in real implementation */
-    int port = 443;
-    char *path = "/v1/chat/completions";
+    struct llm_provider_config *config = get_provider_config(PROVIDER_OPENAI);
+    char *openai_host = config->host_ip;
+    int port = config->port;
+    char *path = config->path;
     struct llm_json_buffer json_buf;
     int ret;
     char auth_header[128];
@@ -344,7 +420,7 @@ int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_res
 
     /* Send request to OpenAI API */
     ret = network_send_request(openai_host, port, path,
-                               NULL, auth_header, true,
+                               NULL, auth_header, false,
                                req->timeout_ms, &json_buf, resp);
 
     /* Handle network errors */
@@ -378,9 +454,10 @@ int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_res
 /* Anthropic API implementation */
 int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
-    char *anthropic_host = "api.anthropic.com";  /* Anthropic API IP - would use DNS in real implementation */
-    int port = 443;
-    char *path = "/v1/messages";
+    struct llm_provider_config *config = get_provider_config(PROVIDER_ANTHROPIC);
+    char *anthropic_host = config->host_ip;
+    int port = config->port;
+    char *path = config->path;
     struct llm_json_buffer json_buf;
     int ret;
     char auth_header[128];
@@ -495,7 +572,7 @@ int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_
 
     /* Send request to Anthropic API */
     ret = network_send_request(anthropic_host, port, path,
-                               NULL, auth_header, true,
+                               NULL, auth_header, false,
                                req->timeout_ms, &json_buf, resp);
 
     /* Handle network errors */
@@ -529,10 +606,11 @@ int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_
 /* Google Gemini API implementation */
 int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
-    char *gemini_host = "generativelanguage.googleapis.com";  /* Google Gemini API IP - would use DNS in real implementation */
+    struct llm_provider_config *config = get_provider_config(PROVIDER_GOOGLE_GEMINI);
+    char *gemini_host = config->host_ip;
+    int port = config->port;
+    char *path = config->path;
     struct llm_json_buffer json_buf;
-    int port = 443;
-    char *path = "/v1/models/gemini-pro:generateContent";  /* Path will include API key */
     int ret;
     char auth_path[256];
     const char *model;
@@ -562,7 +640,11 @@ int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct 
     }
 
     /* Format path with API key */
-    snprintf(auth_path, sizeof(auth_path), "%s?key=%s", path, api_key);
+    if (strchr(path, '?') != NULL) {
+    	snprintf(auth_path, sizeof(auth_path), "/gemini%s&key=%s", path, api_key);
+	} else {
+    	snprintf(auth_path, sizeof(auth_path), "/gemini%s?key=%s", path, api_key);
+	}
 
     /* Initialize JSON buffer */
     ret = json_buffer_init(&json_buf, 4096);
@@ -664,7 +746,7 @@ int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct 
 
     /* Send request to Google Gemini API */
     ret = network_send_request(gemini_host, port, auth_path,
-                               NULL, NULL, true,
+                               NULL, NULL, false,
                                req->timeout_ms, &json_buf, resp);
 
     /* Handle network errors */
@@ -1176,7 +1258,7 @@ static DEVICE_ATTR(fifo_status, 0444, fifo_status_show, NULL);
 static DEVICE_ATTR(context_status, 0444, context_status_show, NULL);
 static DEVICE_ATTR(memory_stats, 0444, memory_stats_show, NULL);
 static DEVICE_ATTR(memory_limits, 0644, memory_limits_show, memory_limits_store);
-
+static DEVICE_ATTR(provider_hosts, 0644, provider_host_show, provider_host_store);
 /* Fix for module initialization order in orchestrator_init() in orchestrator_main.c */
 static int __init orchestrator_init(void)
 {
@@ -1364,6 +1446,11 @@ static int __init orchestrator_init(void)
         pr_err("orchestrator_init: Failed to create memory_limits sysfs attribute: %d\n", ret);
         goto fail_sysfs;
     }
+    ret = device_create_file(orchestrator_device, &dev_attr_provider_hosts);
+	if (ret) {
+    	pr_err("orchestrator_init: Failed to create provider_hosts sysfs attribute: %d\n", ret);
+    	goto fail_sysfs;
+	}
 
     /* Step 11: Initialize mutex */
     mutex_init(&orchestrator_mutex);

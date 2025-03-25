@@ -18,7 +18,13 @@
 #define MAX_PAYLOAD_SIZE (32 * 1024)
 #define MAX_CONTEXT_ENTRIES 100
 #define MAX_FIFO_QUEUE_SIZE 64
-
+#define MAX_HOST_NAME 256
+#define MAX_HEADER_SIZE 2048
+#define MAX_RESPONSE_SIZE (MAX_RESPONSE_LENGTH * 2)
+#define MAX_IP_LENGTH 64
+#define MAX_PATH_LENGTH 512
+#define DEFAULT_TIMEOUT_MS 30000
+#define MAX_REQUEST_TIMEOUT_MS 120000
 /* Error codes */
 #define LLM_ERR_RATE_LIMIT 100
 #define LLM_ERR_AUTH 101
@@ -40,8 +46,16 @@
 #define SCHEDULER_FIFO 6
 #define SCHEDULER_MAX_ALGORITHM SCHEDULER_FIFO
 /* Data structures for requests, responses, contexts */
+
+struct llm_provider_config {
+    char domain_name[MAX_HOST_NAME];  /* Original domain name */
+    char host_ip[MAX_IP_LENGTH];      /* Resolved IP address */
+    int port;
+    char path[MAX_PATH_LENGTH];
+};
 extern spinlock_t conversations_lock;
 /* Request timeout handling */
+
 struct request_timeout_data {
     struct socket *sock;
     struct timer_list timer;
@@ -125,8 +139,8 @@ struct scheduler_state {
     struct fifo_queue fifo;
     bool auto_adjust;
 };
-
-
+bool is_ip_address_valid(const char *ip);
+struct llm_provider_config *get_provider_config(int provider_id);
 /* FIFO queue functions */
 void fifo_init(struct fifo_queue *fifo);
 int fifo_add_provider(struct fifo_queue *fifo, int provider);

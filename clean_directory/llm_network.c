@@ -18,23 +18,18 @@
 #include <net/netlink.h>
 #include "orchestrator_main.h"
 
-#define MAX_HEADER_SIZE 2048
-#define MAX_RESPONSE_SIZE (MAX_RESPONSE_LENGTH * 2)
-#define MAX_IP_LENGTH 64
-#define MAX_PATH_LENGTH 512
-#define DEFAULT_TIMEOUT_MS 30000
-#define MAX_REQUEST_TIMEOUT_MS 120000
+
 
 /* Forward declarations */
 static int case_insensitive_search(const char *haystack, const char *needle);
-static bool is_ip_address_valid(const char *ip);
+bool is_ip_address_valid(const char *ip);
 static bool is_http_path_valid(const char *path);
 static bool is_response_complete(const char *buf, int len);
 static int parse_http_status(const char *buf);
 static bool extract_header_value(const char *response, const char *header_name,
                                  char *value, size_t value_size);
-static bool is_domain_name(const char *host);
-static bool is_host_valid(const char *host);
+
+
 /* Fix 3: Improved locking in request_timeout_callback() in llm_network.c */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
 static void request_timeout_callback(struct timer_list *t)
@@ -101,7 +96,7 @@ static int case_insensitive_search(const char *haystack, const char *needle)
 }
 
 //* Keep the original is_ip_address_valid function for IP validation */
-static bool is_ip_address_valid(const char *ip)
+bool is_ip_address_valid(const char *ip)
 {
     int octets[4];
     int num_octets;
@@ -125,9 +120,7 @@ static bool is_ip_address_valid(const char *ip)
     return true;
 }
 
-/* Validate HTTP path for security */
-static bool is_http_path_valid(const char *path)
-{
+static bool is_http_path_valid(const char *path) {
     size_t len;
 
     if (!path)
@@ -141,17 +134,17 @@ static bool is_http_path_valid(const char *path)
     if (path[0] != '/')
         return false;
 
-    /* Check for invalid characters */
+    /* Check for invalid characters - MODIFIED to allow : */
     for (size_t i = 0; i < len; i++) {
         char c = path[i];
         if (!(isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.' ||
-              c == '=' || c == '?' || c == '&' || c == '%' || c == '+'))
+              c == '=' || c == '?' || c == '&' || c == '%' || c == '+' ||
+              c == ':' || c == ',' || c == ';'))
             return false;
     }
 
     return true;
 }
-
 /* Check if a buffer contains a complete HTTP response */
 static bool is_response_complete(const char *buf, int len)
 {
@@ -320,52 +313,22 @@ static bool extract_header_value(const char *response, const char *header_name,
 
     return true;
 }
-/* Add a new function to validate hosts (either IPs or domain names) */
-static bool is_host_valid(const char *host)
-{
-    const char *p;
-    size_t len;
-    int dots = 0;
-    bool has_alpha = false;
-
-    if (!host)
-        return false;
-
-    len = strlen(host);
-    if (len < 1 || len > MAX_IP_LENGTH)
-        return false;
-
-    /* First check if it's a valid IP address */
-    if (is_ip_address_valid(host))
-        return true;
-
-    /* Not an IP, check if it could be a valid domain name */
-    for (p = host; *p; p++) {
-        if (isalpha(*p))
-            has_alpha = true;
-        else if (*p == '.')
-            dots++;
-        else if (!isdigit(*p) && *p != '-' && *p != '_')
-            return false; /* Invalid character for hostname */
-    }
-
-    /* Basic validation: at least one letter, at least one dot */
-    return has_alpha && dots > 0;
-}
-/* Establish a TCP connection to a remote server with DNS resolution */
-int establish_connection(struct socket **sock, const char *host,
+/* Replace the DNS-related code in establish_connection with this simpler version */
+int establish_connection(struct socket **sock, const char *host_ip,
                          int port, bool use_tls)
 {
     struct socket *s;
     struct sockaddr_in server_addr;
     int ret;
-    bool is_ip;
 
-    if (!sock || !host || port <= 0 || port > 65535)
+    if (!sock || !host_ip || port <= 0 || port > 65535)
         return -EINVAL;
 
-    /* Check if the host is an IP address or a domain name */
-    is_ip = is_ip_address_valid(host);
+    /* Validate IP address */
+    if (!is_ip_address_valid(host_ip)) {
+        pr_err("establish_connection: Invalid IP address format: %s\n", host_ip);
+        return -EINVAL;
+    }
 
     /* Create a TCP socket */
     ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &s);
@@ -374,65 +337,17 @@ int establish_connection(struct socket **sock, const char *host,
         return ret;
     }
 
+    /* Prepare server address */
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
 
-    if (is_ip) {
-        /* Convert IP string to binary */
-        ret = in4_pton(host, -1, (u8 *)&server_addr.sin_addr.s_addr, -1, NULL);
-        if (!ret) {
-            pr_err("establish_connection: IP address conversion failed: %s\n", host);
-            sock_release(s);
-            return -EINVAL;
-        }
-    } else {
-        /* This is a domain name, use kernel DNS resolution */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
-        struct addrinfo hints = { 0 };
-        struct addrinfo *res = NULL;
-        int retries = 3; /* Retry DNS resolution a few times if it fails */
-
-        hints.ai_family = AF_INET; /* IPv4 only for now */
-        hints.ai_socktype = SOCK_STREAM;
-
-        pr_info("establish_connection: Resolving domain name: %s\n", host);
-
-        while (retries > 0) {
-            ret = kernel_getaddrinfo(host, NULL, &hints, &res);
-            if (ret == 0 && res != NULL)
-                break;
-
-            pr_warn("establish_connection: DNS resolution attempt failed for %s: %d, retries left: %d\n",
-                    host, ret, retries - 1);
-            retries--;
-            msleep(100); /* Small delay before retry */
-        }
-
-        if (ret != 0 || res == NULL) {
-            pr_err("establish_connection: DNS resolution failed for %s: %d\n", host, ret);
-            sock_release(s);
-            return ret != 0 ? ret : -ENOENT;
-        }
-
-        /* Copy the resolved IP address */
-        memcpy(&server_addr, res->ai_addr, sizeof(struct sockaddr_in));
-
-        /* Log the resolved IP for debugging */
-        {
-            char ip_buf[INET_ADDRSTRLEN];
-            sprintf(ip_buf, "%pI4", &server_addr.sin_addr.s_addr);
-            pr_info("establish_connection: Resolved %s to %s\n", host, ip_buf);
-        }
-
-        /* Free the address info */
-        kernel_freeaddrinfo(res);
-#else
-        /* Kernel doesn't support DNS resolution */
-        pr_err("establish_connection: Kernel version doesn't support DNS resolution. Use IP address.\n");
+    /* Convert IP string to binary */
+    ret = in4_pton(host_ip, -1, (u8 *)&server_addr.sin_addr.s_addr, -1, NULL);
+    if (!ret) {
+        pr_err("establish_connection: IP address conversion failed: %s\n", host_ip);
         sock_release(s);
-        return -ENOTSUPP;
-#endif
+        return -EINVAL;
     }
 
     /* Set socket options for better reliability */
@@ -455,7 +370,7 @@ int establish_connection(struct socket **sock, const char *host,
     ret = kernel_connect(s, (struct sockaddr *)&server_addr, sizeof(server_addr), 0);
     if (ret < 0) {
         pr_err("establish_connection: kernel_connect failed: %d to %s:%d\n",
-               ret, host, port);
+               ret, host_ip, port);
         sock_release(s);
         return ret;
     }
@@ -474,12 +389,6 @@ int establish_connection(struct socket **sock, const char *host,
     return 0;
 }
 
-/* Helper function to determine if a string is a domain name or IP address */
-static bool is_domain_name(const char *host)
-{
-    /* If it's a valid IP address, it's not a domain name */
-    return !is_ip_address_valid(host);
-}
 
 /* Fix 2: Correctly handle partial sends/receives in llm_network.c */
 static int send_all(struct socket *sock, void *data, size_t len, bool use_tls)
@@ -831,12 +740,164 @@ int network_send_request(const char *host_ip, int port,
     return ret;
 }
 
-/* Initialize network subsystem */
+int network_test_connectivity(void);
+
+/* Define test targets for basic connectivity verification */
+struct connectivity_test_target {
+    const char *name;
+    const char *ip_address;
+    int port;
+};
+
+/* Some widely available and stable servers to test against */
+static struct connectivity_test_target test_targets[] = {
+    {"Cloudflare DNS", "1.1.1.1", 53},     /* Cloudflare DNS - reliable and fast */
+    {"Google DNS", "8.8.8.8", 53},         /* Google DNS - widely accessible */
+    {"Cloudflare HTTPS", "1.1.1.1", 443}   /* Cloudflare HTTPS - tests TLS port */
+};
+
+#define NUM_TEST_TARGETS (sizeof(test_targets) / sizeof(test_targets[0]))
+
+/* Function to test connectivity to a specific target */
+static int test_target_connectivity(const char *name, const char *ip, int port)
+{
+    struct socket *sock = NULL;
+    int ret;
+    unsigned long start_time, end_time, elapsed_ms;
+
+    pr_info("network_init: Testing connectivity to %s (%s:%d)...\n", name, ip, port);
+
+    /* Record start time */
+    start_time = jiffies;
+
+    /* Try to establish a connection with a short timeout */
+    ret = establish_connection(&sock, ip, port, false);
+
+    /* Calculate elapsed time */
+    end_time = jiffies;
+    elapsed_ms = jiffies_to_msecs(end_time - start_time);
+
+    if (ret < 0) {
+        pr_warn("network_init: Connection to %s (%s:%d) failed: %d (took %lu ms)\n",
+                name, ip, port, ret, elapsed_ms);
+        goto cleanup;
+    }
+
+    pr_info("network_init: Successfully connected to %s (%s:%d) in %lu ms\n",
+            name, ip, port, elapsed_ms);
+
+cleanup:
+    /* Close the connection */
+    if (sock) {
+        kernel_sock_shutdown(sock, SHUT_RDWR);
+        sock_release(sock);
+    }
+
+    return ret;
+}
+
+extern struct llm_provider_config provider_configs[PROVIDER_COUNT];
+
+/* Initialize network subsystem with connectivity testing */
 int network_init(void)
 {
+    int i, ret;
+    int success_count = 0;
+    bool network_functional = false;
+
+    pr_info("LLM network subsystem initializing...\n");
+
+    /* First, perform basic network connectivity tests */
+    pr_info("network_init: Testing basic internet connectivity...\n");
+
+    for (i = 0; i < NUM_TEST_TARGETS; i++) {
+        if (test_target_connectivity(test_targets[i].name,
+                                     test_targets[i].ip_address,
+                                     test_targets[i].port) == 0) {
+            success_count++;
+            network_functional = true;  /* At least one connection succeeded */
+        }
+    }
+
+    /* Report results - Fix: use %d for int, not unsigned long */
+    if (network_functional) {
+        pr_info("network_init: Basic connectivity test passed (%d/%d targets reachable)\n",
+                success_count, (int)NUM_TEST_TARGETS);
+    } else {
+        pr_warn("network_init: FAILED to reach ANY test targets. Network connectivity issues detected.\n");
+        pr_warn("network_init: The module will continue to load, but API requests are likely to fail.\n");
+        pr_warn("network_init: Please check your internet connection and firewall settings.\n");
+    }
+
+    if (network_functional) {
+    	/* Test LLM API endpoints using the actual provider configurations */
+    	int api_success = 0;
+    	const char *provider_names[] = {"OpenAI", "Anthropic", "Google Gemini"};
+
+    	pr_info("network_init: Testing LLM API endpoints...\n");
+
+    	for (i = 0; i < PROVIDER_COUNT; i++) {
+        /* Skip if IP is invalid */
+        	if (!is_ip_address_valid(provider_configs[i].host_ip)) {
+            	pr_warn("network_init: Invalid IP address for %s: %s\n",
+                    	provider_names[i], provider_configs[i].host_ip);
+            	continue;
+        	}
+
+        	ret = test_target_connectivity(provider_names[i],
+                                      provider_configs[i].host_ip,
+                                      provider_configs[i].port);
+        	if (ret == 0) {
+            	api_success++;
+            	pr_info("network_init: Successfully verified connectivity to %s API (%s)\n",
+                   	provider_names[i], provider_configs[i].domain_name);
+        	} else {
+            	pr_warn("network_init: Failed to connect to %s API (%s)\n",
+                   	provider_names[i], provider_configs[i].domain_name);
+        	}
+    	}
+
+    	pr_info("network_init: API endpoint connectivity test complete: %d/%d endpoints reachable\n",
+            	api_success, PROVIDER_COUNT);
+	} else {
+    	pr_warn("network_init: Skipping API endpoint tests due to basic connectivity failure\n");
+	}
+    /* Additional network subsystem initialization can go here */
+
     pr_info("LLM network subsystem initialized\n");
-    return 0;
+    return 0;  /* Always return success; we don't want to fail module loading over network issues */
 }
+
+/*
+ * Additional function that can be exported for on-demand testing
+ * This can be triggered via ioctl or sysfs to test connectivity anytime
+ */
+int network_test_connectivity(void)
+{
+    int i;
+    int success_count = 0;
+
+    pr_info("network: Running on-demand connectivity test\n");
+
+    for (i = 0; i < NUM_TEST_TARGETS; i++) {
+        if (test_target_connectivity(test_targets[i].name,
+                                     test_targets[i].ip_address,
+                                     test_targets[i].port) == 0) {
+            success_count++;
+        }
+    }
+
+    /* Fix: use %d for int, not unsigned long */
+    pr_info("network: Connectivity test complete: %d/%d targets reachable\n",
+            success_count, (int)NUM_TEST_TARGETS);
+
+    return success_count;
+}
+
+
+
+/* Export the function for use elsewhere */
+
 
 /* Cleanup network subsystem */
 void network_cleanup(void)
@@ -848,3 +909,5 @@ EXPORT_SYMBOL(establish_connection);
 EXPORT_SYMBOL(network_send_request);
 EXPORT_SYMBOL(network_init);
 EXPORT_SYMBOL(network_cleanup);
+EXPORT_SYMBOL(is_ip_address_valid);
+EXPORT_SYMBOL(network_test_connectivity);
