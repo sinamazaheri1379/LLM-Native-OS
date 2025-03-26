@@ -59,7 +59,7 @@ static void request_timeout_callback(unsigned long ptr)
 
 /* External TLS interface function */
 extern int setup_tls(struct socket *sock);
-extern void cleanup_tls(struct socket *sock);
+extern void tls_cleanup(struct socket *sock);
 extern int tls_send(struct socket *sock, void *data, size_t len);
 extern int tls_recv(struct socket *sock, void *data, size_t len, int flags);
 
@@ -407,6 +407,13 @@ static int send_all(struct socket *sock, void *data, size_t len, bool use_tls)
             iov.iov_len = len - sent;
 
             this_sent = kernel_sendmsg(sock, &msg, &iov, 1, len - sent);
+            // Properly formatted logging statements
+			pr_info("Sent MSG: %p", &msg);                        // Print msg address
+			pr_info("Sent IOV.IOV_BASE addr: %p, IOV.IOV_LEN: %zu",
+        			iov.iov_base, iov.iov_len);                   // Print base address and length
+			pr_info("Sent LEN: %zu", len);                        // Print total length
+			pr_info("Sent SENT: %zu", sent);                      // Print bytes sent so far
+			pr_info("This operation sent: %d bytes", this_sent);  // Print bytes in this operation
         }
 
         if (this_sent < 0)
@@ -422,6 +429,95 @@ static int send_all(struct socket *sock, void *data, size_t len, bool use_tls)
 
     return sent;
 }
+
+/* Send multiple buffers efficiently using scatter-gather I/O */
+static int send_iov_all(struct socket *sock, struct kvec *iov, size_t iov_count, size_t total_len, bool use_tls)
+{
+    size_t sent = 0;
+    struct kvec *current_iov;
+    size_t current_iov_offset = 0;
+    size_t remaining_in_iov;
+    int this_sent;
+    struct msghdr msg = {0};
+    /* Use fixed-size array instead of VLA for kernel code */
+    struct kvec tmp_iov[8]; /* Reasonably large fixed size - more than enough for our needs */
+    size_t tmp_count;
+
+    /* Check if we have too many iovs (unlikely) */
+    if (iov_count > 8) {
+        pr_err("send_iov_all: Too many iov buffers\n");
+        return -EINVAL;
+    }
+
+    /* If using TLS, we have to send one buffer at a time since tls_send doesn't support scatter-gather */
+    if (use_tls) {
+        int ret = 0;
+        size_t i;
+
+        for (i = 0; i < iov_count; i++) {
+            ret = send_all(sock, iov[i].iov_base, iov[i].iov_len, use_tls);
+            if (ret < 0)
+                return ret;
+        }
+
+        return total_len;
+    }
+
+    /* For non-TLS, use scatter-gather I/O */
+    while (sent < total_len) {
+        /* Find the current iov based on how much we've sent so far */
+        size_t consumed = 0;
+        size_t i; /* Declare loop variable outside for C90 compliance */
+        current_iov = NULL;
+
+        for (i = 0; i < iov_count; i++) {
+            if (sent < consumed + iov[i].iov_len) {
+                current_iov = &iov[i];
+                current_iov_offset = sent - consumed;
+                break;
+            }
+            consumed += iov[i].iov_len;
+        }
+
+        if (!current_iov) {
+            pr_err("send_iov_all: IOV calculation error\n");
+            return -EINVAL;
+        }
+
+        /* Prepare current position */
+        remaining_in_iov = current_iov->iov_len - current_iov_offset;
+
+        /* Create a temporary iov for the current position */
+        tmp_count = 0;
+
+        /* Add the current iov from its offset */
+        tmp_iov[tmp_count].iov_base = (char*)current_iov->iov_base + current_iov_offset;
+        tmp_iov[tmp_count].iov_len = remaining_in_iov;
+        tmp_count++;
+
+        /* Add any remaining iovs */
+        for (i = (current_iov - iov) + 1; i < iov_count; i++) {
+            tmp_iov[tmp_count] = iov[i];
+            tmp_count++;
+        }
+
+        /* Send using scatter-gather */
+        this_sent = kernel_sendmsg(sock, &msg, tmp_iov, tmp_count, total_len - sent);
+
+        pr_info("Sent %d bytes using scatter-gather with %zu buffers", this_sent, tmp_count);
+
+        if (this_sent < 0)
+            return this_sent;
+
+        if (this_sent == 0)
+            return -ECONNRESET; /* Connection closed */
+
+        sent += this_sent;
+    }
+
+    return sent;
+}
+
 
 /* Fix 3: Fix for memory leak in network_send_request() in llm_network.c */
 int network_send_request(const char *host_ip, int port,
@@ -494,19 +590,19 @@ int network_send_request(const char *host_ip, int port,
 
     /* Prepare HTTP headers with proper escaping */
     header_len = snprintf(headers, MAX_HEADER_SIZE,
-                          "POST %s HTTP/1.1\r\n"
-                          "Host: %s\r\n"
-                          "%s%s\r\n"
-                          "Content-Type: application/json\r\n"
-                          "Content-Length: %zu\r\n"
-                          "Connection: close\r\n"
-                          "User-Agent: LLM-Orchestrator/%s\r\n"
-                          "\r\n",
-                          http_path, host_ip,
-                          auth_header ? auth_header : "",
-                          api_key ? api_key : "",
-                          buf->used,
-                          DRIVER_VERSION);
+                      "POST %s HTTP/1.1\r\n"
+                      "Host: %s\r\n"
+                      "%s%s"  /* No \r\n after these - they're included in the variables */
+                      "Content-Type: application/json\r\n"
+                      "Content-Length: %zu\r\n"  /* %zu for size_t */
+                      "Connection: close\r\n"
+                      "User-Agent: LLM-Orchestrator/%s\r\n"
+                      "\r\n",
+                      http_path, host_ip,
+                      auth_header ? auth_header : "",
+                      api_key ? api_key : "",
+                      buf->used,
+                      DRIVER_VERSION);
 
     if (header_len < 0 || header_len >= MAX_HEADER_SIZE) {
         pr_err("network_send_request: HTTP headers too large\n");
@@ -558,16 +654,12 @@ int network_send_request(const char *host_ip, int port,
 
     mod_timer(&timeout_data->timer, jiffies + msecs_to_jiffies(timeout_ms + 1000)); /* 1s extra margin */
 
+    pr_info("network_send_request: Header\r\n//=========================//\r\n%s", headers);
     /* Send the request - use send_all to handle partial sends */
-    ret = send_all(sock, headers, header_len, use_tls);
+	pr_info("network_send_request: Payload\r\n//=========================//\r\n%s", buf->data);
+    ret = send_iov_all(sock, iov, 2, total_len, use_tls);
     if (ret < 0) {
-        pr_err("network_send_request: send headers failed: %d\n", ret);
-        goto exit_cleanup_timer;
-    }
-
-    ret = send_all(sock, buf->data, buf->used, use_tls);
-    if (ret < 0) {
-        pr_err("network_send_request: send data failed: %d\n", ret);
+        pr_err("network_send_request: send request failed: %d\n", ret);
         goto exit_cleanup_timer;
     }
 
@@ -593,12 +685,18 @@ int network_send_request(const char *host_ip, int port,
 
         recv_iov.iov_base = recv_buf + received;
         recv_iov.iov_len = MAX_RESPONSE_SIZE - received - 1;
-
+		/* Add logging before receive operation */
+    	pr_info("Receiving data - Buffer position: %p, Available space: %zu bytes",
+            recv_iov.iov_base, recv_iov.iov_len);
+    	pr_info("Total received so far: %d of %d maximum bytes",
+            received, MAX_RESPONSE_SIZE);
         /* Use TLS recv if TLS is enabled */
         if (use_tls) {
             this_recv = tls_recv(sock, recv_iov.iov_base, recv_iov.iov_len, 0);
         } else {
             this_recv = kernel_recvmsg(sock, &msg, &recv_iov, 1, recv_iov.iov_len, 0);
+             pr_info("kernel_recvmsg returned: %d bytes", this_recv);
+        pr_info("MSG: %p, IOV count: 1, Flags: 0", &msg);
         }
 
         if (this_recv < 0) {
@@ -612,15 +710,19 @@ int network_send_request(const char *host_ip, int port,
             goto exit_cleanup_buffer;
         }
 
-        if (this_recv == 0) /* End of data */
-            break;
+        if (this_recv == 0) { /* End of data */
+        	pr_info("Received end of data marker (0 bytes)");
+        	break;
+    	}
 
         received += this_recv;
         recv_buf[received] = '\0'; /* Ensure null-termination */
-
+		pr_info("Updated total received: %d bytes", received);
         /* Check if we have received a complete response */
-        if (is_response_complete(recv_buf, received))
+        if (is_response_complete(recv_buf, received)){
+          	pr_info("Detected complete response, stopping receive loop");
             break;
+        }
     }
 
     /* Mark request as completed */
@@ -631,7 +733,7 @@ int network_send_request(const char *host_ip, int port,
         pr_warn("network_send_request: Response truncated (exceeds %d bytes)\n",
                 MAX_RESPONSE_SIZE - 1);
     }
-
+	pr_info("Network Received:\r\n%s", recv_buf);
     /* Parse HTTP status code */
     resp->status = parse_http_status(recv_buf);
 
@@ -725,7 +827,7 @@ int network_send_request(const char *host_ip, int port,
     exit_release_sock:
     if (sock) {
         /* Clean up TLS resources if any */
-        cleanup_tls(sock);
+        tls_cleanup(sock);
         sock_release(sock);
         sock = NULL;
     }

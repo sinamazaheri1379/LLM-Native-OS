@@ -11,7 +11,7 @@
 /* Constants for buffer sizes, error codes */
 #define DRIVER_VERSION "2.0"
 #define MAX_PROMPT_LENGTH 4096
-#define MAX_RESPONSE_LENGTH 8192
+#define MAX_RESPONSE_LENGTH 65535
 #define MAX_MODEL_NAME 64
 #define MAX_ROLE_NAME 32
 #define MAX_CONTENT_LENGTH 4096
@@ -187,7 +187,6 @@ void fifo_cleanup(struct fifo_queue *fifo);
 
 /* Network and TLS functions */
 int setup_tls(struct socket *sock);
-void cleanup_tls(struct socket *sock);
 int establish_connection(struct socket **sock, const char *host_ip, int port, bool use_tls);
 int network_send_request(const char *host_ip, int port, const char *http_path,
                          const char *api_key, const char *auth_header, bool use_tls,
@@ -226,7 +225,7 @@ void network_cleanup(void);
 
 /* TLS subsystem functions */
 int tls_init(void);
-void tls_cleanup(void);
+void tls_cleanup(struct socket *sock);
 /* JSON manager additional functions */
 bool json_manager_initialized_check(void);
 int json_buffer_resize(struct llm_json_buffer *buf, size_t new_size);

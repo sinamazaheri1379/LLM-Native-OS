@@ -74,9 +74,9 @@ struct scheduler_registry_entry {
 
 /* In orchestrator_main.c, add the provider configurations */
 struct llm_provider_config provider_configs[PROVIDER_COUNT] = {
-    { "api.openai.com", "127.0.0.1", 8080, "/v1/chat/completions" },      /* OpenAI */
-    { "api.anthropic.com", "127.0.0.1", 8080, "/v1/messages" },           /* Anthropic */
-    { "generativelanguage.googleapis.com", "127.0.0.1", 8080, "/v1/models/gemini-pro:generateContent" } /* Gemini */
+    { "api.openai.com", "127.0.0.1", 8080, "/openai/v1/chat/completions" },      /* OpenAI */
+    { "api.anthropic.com", "127.0.0.1", 8080, "/anthropic/v1/messages" },           /* Anthropic */
+    { "generativelanguage.googleapis.com", "127.0.0.1", 8080, "/gemini/v1/models/gemini-pro:generateContent" } /* Gemini */
 };
 
 /* Function to get provider configuration */
@@ -308,7 +308,7 @@ int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_res
     char *path = config->path;
     struct llm_json_buffer json_buf;
     int ret;
-    char auth_header[128];
+    char auth_header[512];
     const char *model;
 
     if (!api_key || !req || !resp) {
@@ -403,16 +403,16 @@ int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_res
     if (ret) goto cleanup;
 
     /* Complete the JSON request */
-    ret = append_json_string(&json_buf, "],\"temperature\":");
-    if (ret) goto cleanup;
-
-    ret = append_json_float(&json_buf, req->temperature_x100);
-    if (ret) goto cleanup;
-
-    ret = append_json_string(&json_buf, ",\"max_tokens\":");
+	ret = append_json_string(&json_buf, "],\"max_tokens\":");
     if (ret) goto cleanup;
 
     ret = append_json_number(&json_buf, req->max_tokens);
+    if (ret) goto cleanup;
+
+    ret = append_json_string(&json_buf, ",\"temperature\":");
+    if (ret) goto cleanup;
+	ret = append_json_float(&json_buf, req->temperature_x100);
+
     if (ret) goto cleanup;
 
     ret = append_json_string(&json_buf, "}");
@@ -460,7 +460,7 @@ int llm_send_anthropic(const char *api_key, struct llm_request *req, struct llm_
     char *path = config->path;
     struct llm_json_buffer json_buf;
     int ret;
-    char auth_header[128];
+    char auth_header[512];
     const char *model;
 
     if (!api_key || !req || !resp) {
@@ -612,7 +612,7 @@ int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct 
     char *path = config->path;
     struct llm_json_buffer json_buf;
     int ret;
-    char auth_path[256];
+    char auth_path[512];
     const char *model;
 
     if (!api_key || !req || !resp) {
@@ -775,38 +775,6 @@ int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct 
     cleanup:
     json_buffer_free(&json_buf);
     return ret;
-}
-
-
-/* Function to safely set API keys */
-static int set_api_key(int provider, const char *key)
-{
-    size_t key_len;
-    char *secure_key;
-
-    if (!key || provider < 0 || provider >= 3)
-        return -EINVAL;
-
-    key_len = strlen(key);
-    if (key_len < 8 || key_len > 256)
-        return -EINVAL;  /* Validate reasonable key length */
-
-    /* Allocate secure memory */
-    secure_key = kzalloc(key_len + 1, GFP_KERNEL);
-    if (!secure_key)
-        return -ENOMEM;
-
-    /* Copy key */
-    strscpy(secure_key, key, key_len + 1);
-
-    /* Free old key if it exists */
-    if (secure_api_keys[provider]) {
-        memzero_explicit(secure_api_keys[provider], strlen(secure_api_keys[provider]));
-        kfree(secure_api_keys[provider]);
-    }
-
-    secure_api_keys[provider] = secure_key;
-    return 0;
 }
 
 /* Clear all API keys securely */
@@ -1321,42 +1289,42 @@ static int __init orchestrator_init(void)
     memset(&global_response, 0, sizeof(global_response));
     pr_info("LLM Orchestrator: Scheduler initialized\n");
 
-    /* Step 7: Set API keys securely */
-    if (openai_api_key && strlen(openai_api_key) > 0) {
-        if (set_api_key(PROVIDER_OPENAI, openai_api_key) == 0) {
-            /* Clear the module parameter after securely storing it */
-            memzero_explicit(openai_api_key, strlen(openai_api_key));
-        } else {
-            pr_warn("Failed to securely store OpenAI API key\n");
-        }
-    } else {
-        pr_warn("No OpenAI API key provided\n");
-    }
+//    /* Step 7: Set API keys securely */
+//    if (openai_api_key && strlen(openai_api_key) > 0) {
+//        if (set_api_key(PROVIDER_OPENAI, openai_api_key) == 0) {
+//            /* Clear the module parameter after securely storing it */
+//            memzero_explicit(openai_api_key, strlen(openai_api_key));
+//       } else {
+//            pr_warn("Failed to securely store OpenAI API key\n");
+//        }
+//    } else {
+//        pr_warn("No OpenAI API key provided\n");
+//    }
 
-    if (anthropic_api_key && strlen(anthropic_api_key) > 0) {
-        if (set_api_key(PROVIDER_ANTHROPIC, anthropic_api_key) == 0) {
+//    if (anthropic_api_key && strlen(anthropic_api_key) > 0) {
+//        if (set_api_key(PROVIDER_ANTHROPIC, anthropic_api_key) == 0) {
             /* Clear the module parameter after securely storing it */
-            memzero_explicit(anthropic_api_key, strlen(anthropic_api_key));
-        } else {
-            pr_warn("Failed to securely store Anthropic API key\n");
-        }
-    } else {
-        pr_warn("No Anthropic API key provided\n");
-    }
+//            memzero_explicit(anthropic_api_key, strlen(anthropic_api_key));
+//        } else {
+//            pr_warn("Failed to securely store Anthropic API key\n");
+//        }
+//    } else {
+//        pr_warn("No Anthropic API key provided\n");
+//    }
 
-    if (google_gemini_api_key && strlen(google_gemini_api_key) > 0) {
-        if (set_api_key(PROVIDER_GOOGLE_GEMINI, google_gemini_api_key) == 0) {
-            /* Clear the module parameter after securely storing it */
-            memzero_explicit(google_gemini_api_key, strlen(google_gemini_api_key));
-        } else {
-            pr_warn("Failed to securely store Google Gemini API key\n");
-        }
-    } else {
-        pr_warn("No Google Gemini API key provided\n");
-    }
+//    if (google_gemini_api_key && strlen(google_gemini_api_key) > 0) {
+//        if (set_api_key(PROVIDER_GOOGLE_GEMINI, google_gemini_api_key) == 0) {
+//            /* Clear the module parameter after securely storing it */
+ //           memzero_explicit(google_gemini_api_key, strlen(google_gemini_api_key));
+ //       } else {
+ //           pr_warn("Failed to securely store Google Gemini API key\n");
+ //       }
+ //   } else {
+ //       pr_warn("No Google Gemini API key provided\n");
+ //   }
 
     /* Step 8: Register character device */
-    ret = alloc_chrdev_region(&dev, 0, 1, MODULE_NAME);
+   ret = alloc_chrdev_region(&dev, 0, 1, MODULE_NAME);
     if (ret < 0) {
         pr_err("orchestrator_init: Failed to allocate chrdev region: %d\n", ret);
         goto fail_chrdev;
@@ -1479,7 +1447,6 @@ static int __init orchestrator_init(void)
     unregister_chrdev_region(MKDEV(major_number, 0), 1);
     fail_chrdev:
     clear_all_api_keys();
-    tls_cleanup();
     fail_tls:
     network_cleanup();
     fail_network:
@@ -1526,7 +1493,6 @@ static void __exit orchestrator_exit(void)
     pr_debug("LLM Orchestrator: API keys securely cleared\n");
 
     /* Step 5: Clean up TLS */
-    tls_cleanup();
     pr_debug("LLM Orchestrator: TLS subsystem cleaned up\n");
 
     /* Step 6: Clean up network */
