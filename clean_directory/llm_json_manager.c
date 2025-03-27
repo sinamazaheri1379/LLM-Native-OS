@@ -703,13 +703,18 @@ static int extract_number_after_field(const char *json, const char *field_name, 
  * Extract assistant message content from OpenAI response format
  * Specifically handles the OpenAI-style nested JSON with choices array
  */
+/*
+ * Extract assistant message content from OpenAI response format
+ * Handles chunked transfer encoding
+ */
 int extract_openai_content(const char *json, char *output, size_t output_size)
 {
+    char *decoded_json = NULL;
     const char *choices_marker = "\"choices\":[";
     const char *message_marker = "\"message\":{";
     const char *content_marker = "\"content\":\"";
     const char *choices_pos, *message_pos, *content_pos, *content_end;
-    int i;
+    int i, result = -EINVAL;
     size_t out_idx = 0;
     bool escaped = false;
 
@@ -719,30 +724,43 @@ int extract_openai_content(const char *json, char *output, size_t output_size)
     /* Clear output buffer */
     output[0] = '\0';
 
-    /* Skip chunked encoding markers if present */
-    while (*json && *json != '{' && *json != '[') {
-        json++;
+    /* First, allocate a buffer for the decoded JSON */
+    decoded_json = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
+    if (!decoded_json) {
+        pr_err("extract_openai_content: Failed to allocate decode buffer\n");
+        return -ENOMEM;
+    }
+
+    /* Decode chunked encoding if present */
+    if (decode_chunked_response(json, decoded_json, MAX_RESPONSE_LENGTH) <= 0) {
+        /* Decoding failed or unnecessary, use original */
+        pr_debug("extract_openai_content: Chunk decoding failed, using original\n");
+        strncpy(decoded_json, json, MAX_RESPONSE_LENGTH - 1);
+        decoded_json[MAX_RESPONSE_LENGTH - 1] = '\0';
     }
 
     /* Find the choices array */
-    choices_pos = strstr(json, choices_marker);
+    choices_pos = strstr(decoded_json, choices_marker);
     if (!choices_pos) {
         pr_debug("extract_openai_content: Failed to find choices array\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Find the message object within the first choice */
     message_pos = strstr(choices_pos, message_marker);
     if (!message_pos) {
         pr_debug("extract_openai_content: Failed to find message object\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Find the content field */
     content_pos = strstr(message_pos, content_marker);
     if (!content_pos) {
         pr_debug("extract_openai_content: Failed to find content field\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Skip past the content marker and opening quote */
@@ -763,10 +781,11 @@ int extract_openai_content(const char *json, char *output, size_t output_size)
 
     if (*content_end != '"') {
         pr_debug("extract_openai_content: Failed to find end of content\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
-    /* Copy and unescape content - reuse your existing code for this part */
+    /* Copy and unescape content */
     for (i = 0; content_pos + i < content_end && out_idx < output_size - 1; i++) {
         if (content_pos[i] == '\\' && i + 1 < (content_end - content_pos)) {
             i++;
@@ -774,9 +793,14 @@ int extract_openai_content(const char *json, char *output, size_t output_size)
                 case 'n': output[out_idx++] = '\n'; break;
                 case 'r': output[out_idx++] = '\r'; break;
                 case 't': output[out_idx++] = '\t'; break;
+                case 'b': output[out_idx++] = '\b'; break;
+                case 'f': output[out_idx++] = '\f'; break;
                 case '"': output[out_idx++] = '"'; break;
                 case '\\': output[out_idx++] = '\\'; break;
-                /* Handle other escape sequences as in your existing code */
+                case 'u': /* Unicode escape - simplified handling */
+                    output[out_idx++] = '?'; /* Placeholder for Unicode */
+                    i += 4; /* Skip past the 4 hex digits */
+                    break;
                 default: output[out_idx++] = content_pos[i]; break;
             }
         } else {
@@ -785,20 +809,27 @@ int extract_openai_content(const char *json, char *output, size_t output_size)
     }
 
     output[out_idx] = '\0';
-    return out_idx;
+    result = out_idx;
+
+cleanup:
+    if (decoded_json)
+        kfree(decoded_json);
+
+    return result;
 }
 
 /*
  * Extract content from Anthropic (Claude) response format
+ * Handles chunked transfer encoding
  */
 int extract_anthropic_content(const char *json, char *output, size_t output_size)
 {
-    /* Anthropic has two main formats to handle */
+    char *decoded_json = NULL;
     const char *content_text_marker = "\"text\":\"";  /* New Claude format */
     const char *completion_marker = "\"completion\":\"";  /* Older format */
     const char *content_pos = NULL;
     const char *content_end;
-    int i;
+    int i, result = -EINVAL;
     size_t out_idx = 0;
     bool escaped = false;
 
@@ -807,12 +838,27 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
 
     output[0] = '\0';
 
+    /* First, allocate a buffer for the decoded JSON */
+    decoded_json = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
+    if (!decoded_json) {
+        pr_err("extract_anthropic_content: Failed to allocate decode buffer\n");
+        return -ENOMEM;
+    }
+
+    /* Decode chunked encoding if present */
+    if (decode_chunked_response(json, decoded_json, MAX_RESPONSE_LENGTH) <= 0) {
+        /* Decoding failed or unnecessary, use original */
+        pr_debug("extract_anthropic_content: Chunk decoding failed, using original\n");
+        strncpy(decoded_json, json, MAX_RESPONSE_LENGTH - 1);
+        decoded_json[MAX_RESPONSE_LENGTH - 1] = '\0';
+    }
+
     /* Try to find the new format with "content" array with "text" field */
-    content_pos = strstr(json, content_text_marker);
+    content_pos = strstr(decoded_json, content_text_marker);
 
     /* If not found, try the older format with "completion" field */
     if (!content_pos) {
-        content_pos = strstr(json, completion_marker);
+        content_pos = strstr(decoded_json, completion_marker);
         if (content_pos) {
             content_pos += strlen(completion_marker);
         }
@@ -822,7 +868,8 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
 
     if (!content_pos) {
         pr_debug("extract_anthropic_content: Failed to find content field\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Find the end quote of the content */
@@ -840,7 +887,8 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
 
     if (*content_end != '"') {
         pr_debug("extract_anthropic_content: Failed to find end of content\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Copy and unescape content */
@@ -851,8 +899,14 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
                 case 'n': output[out_idx++] = '\n'; break;
                 case 'r': output[out_idx++] = '\r'; break;
                 case 't': output[out_idx++] = '\t'; break;
+                case 'b': output[out_idx++] = '\b'; break;
+                case 'f': output[out_idx++] = '\f'; break;
                 case '"': output[out_idx++] = '"'; break;
                 case '\\': output[out_idx++] = '\\'; break;
+                case 'u': /* Unicode escape - simplified handling */
+                    output[out_idx++] = '?'; /* Placeholder for Unicode */
+                    i += 4; /* Skip past the 4 hex digits */
+                    break;
                 default: output[out_idx++] = content_pos[i]; break;
             }
         } else {
@@ -861,19 +915,27 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
     }
 
     output[out_idx] = '\0';
-    return out_idx;
+    result = out_idx;
+
+cleanup:
+    if (decoded_json)
+        kfree(decoded_json);
+
+    return result;
 }
 
 /*
  * Extract content from Google Gemini response format
+ * Handles chunked transfer encoding
  */
 int extract_gemini_content(const char *json, char *output, size_t output_size)
 {
+    char *decoded_json = NULL;
     const char *candidates_marker = "\"candidates\":[";
     const char *parts_marker = "\"parts\":[";
     const char *text_marker = "\"text\":\"";
     const char *candidates_pos, *parts_pos, *text_pos, *content_end;
-    int i;
+    int i, result = -EINVAL;
     size_t out_idx = 0;
     bool escaped = false;
 
@@ -882,25 +944,43 @@ int extract_gemini_content(const char *json, char *output, size_t output_size)
 
     output[0] = '\0';
 
+    /* First, allocate a buffer for the decoded JSON */
+    decoded_json = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
+    if (!decoded_json) {
+        pr_err("extract_gemini_content: Failed to allocate decode buffer\n");
+        return -ENOMEM;
+    }
+
+    /* Decode chunked encoding if present */
+    if (decode_chunked_response(json, decoded_json, MAX_RESPONSE_LENGTH) <= 0) {
+        /* Decoding failed or unnecessary, use original */
+        pr_debug("extract_gemini_content: Chunk decoding failed, using original\n");
+        strncpy(decoded_json, json, MAX_RESPONSE_LENGTH - 1);
+        decoded_json[MAX_RESPONSE_LENGTH - 1] = '\0';
+    }
+
     /* Find the candidates array */
-    candidates_pos = strstr(json, candidates_marker);
+    candidates_pos = strstr(decoded_json, candidates_marker);
     if (!candidates_pos) {
         pr_debug("extract_gemini_content: Failed to find candidates array\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Find the parts array in the first candidate */
     parts_pos = strstr(candidates_pos, parts_marker);
     if (!parts_pos) {
         pr_debug("extract_gemini_content: Failed to find parts array\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Find the text field */
     text_pos = strstr(parts_pos, text_marker);
     if (!text_pos) {
         pr_debug("extract_gemini_content: Failed to find text field\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Skip past the text marker and opening quote */
@@ -921,7 +1001,8 @@ int extract_gemini_content(const char *json, char *output, size_t output_size)
 
     if (*content_end != '"') {
         pr_debug("extract_gemini_content: Failed to find end of content\n");
-        return -EINVAL;
+        result = -EINVAL;
+        goto cleanup;
     }
 
     /* Copy and unescape content */
@@ -932,8 +1013,14 @@ int extract_gemini_content(const char *json, char *output, size_t output_size)
                 case 'n': output[out_idx++] = '\n'; break;
                 case 'r': output[out_idx++] = '\r'; break;
                 case 't': output[out_idx++] = '\t'; break;
+                case 'b': output[out_idx++] = '\b'; break;
+                case 'f': output[out_idx++] = '\f'; break;
                 case '"': output[out_idx++] = '"'; break;
                 case '\\': output[out_idx++] = '\\'; break;
+                case 'u': /* Unicode escape - simplified handling */
+                    output[out_idx++] = '?'; /* Placeholder for Unicode */
+                    i += 4; /* Skip past the 4 hex digits */
+                    break;
                 default: output[out_idx++] = text_pos[i]; break;
             }
         } else {
@@ -942,7 +1029,13 @@ int extract_gemini_content(const char *json, char *output, size_t output_size)
     }
 
     output[out_idx] = '\0';
-    return out_idx;
+    result = out_idx;
+
+cleanup:
+    if (decoded_json)
+        kfree(decoded_json);
+
+    return result;
 }
 /* Fix 2: Improved JSON parsing robustness in extract_response_content() in llm_json_manager.c */
 int extract_response_content(const char *json, char *output, size_t output_size)
