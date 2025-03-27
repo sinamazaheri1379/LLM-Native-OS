@@ -733,7 +733,88 @@ int network_send_request(const char *host_ip, int port,
         pr_warn("network_send_request: Response truncated (exceeds %d bytes)\n",
                 MAX_RESPONSE_SIZE - 1);
     }
-	pr_info("Network Received:\r\n%s", recv_buf);
+	{
+    /* Define maximum chunk size - kernel printk buffer is often ~1024 bytes */
+    #define CHUNK_SIZE 900 /* Use #define instead of const int */
+    char *body_start;
+    int remaining_len;
+    int header_len = 0;
+    char *temp_buf = NULL;
+
+    /* Print the beginning of the response and headers */
+    pr_info("Network Received - HEADERS:\r\n");
+
+    /* Find the end of headers (blank line) */
+    body_start = strstr(recv_buf, "\r\n\r\n");
+    if (body_start) {
+        /* Calculate header length */
+        header_len = (body_start - recv_buf) + 4; /* +4 for the \r\n\r\n */
+
+        /* Print headers as a separate chunk to make them clearly visible */
+        if (header_len < CHUNK_SIZE) {
+            /* Allocate buffer instead of using VLA */
+            temp_buf = kmalloc(CHUNK_SIZE + 1, GFP_KERNEL);
+            if (temp_buf) {
+                memcpy(temp_buf, recv_buf, header_len);
+                temp_buf[header_len] = '\0';
+                pr_info("%s", temp_buf);
+                kfree(temp_buf);
+                temp_buf = NULL;
+            } else {
+                /* Fallback if allocation fails */
+                pr_info("%.900s", recv_buf);
+            }
+        } else {
+            /* Very unlikely case - headers exceed chunk size */
+            pr_info("%.900s...", recv_buf);
+        }
+
+        /* Move body_start past \r\n\r\n */
+        body_start += 4;
+
+        /* Calculate remaining length */
+        remaining_len = received - header_len;
+
+        if (remaining_len > 0) {
+            int chunk, num_chunks, i;
+
+            /* Calculate number of chunks needed */
+            num_chunks = (remaining_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+            pr_info("Network Received - BODY (%d bytes in %d chunks):",
+                    remaining_len, num_chunks);
+
+            /* Print each chunk */
+            for (i = 0; i < num_chunks; i++) {
+                chunk = (remaining_len > CHUNK_SIZE) ? CHUNK_SIZE : remaining_len;
+
+                pr_info("BODY CHUNK %d/%d:\r\n%.900s",
+                        i + 1, num_chunks, body_start + (i * CHUNK_SIZE));
+
+                remaining_len -= chunk;
+            }
+        } else {
+            pr_info("Network Received - No body content");
+        }
+    } else {
+        /* No body found, print the whole message in chunks */
+        remaining_len = received;
+        int chunk, num_chunks, i;
+
+        /* Calculate number of chunks needed */
+        num_chunks = (remaining_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        for (i = 0; i < num_chunks; i++) {
+            chunk = (remaining_len > CHUNK_SIZE) ? CHUNK_SIZE : remaining_len;
+
+            pr_info("CONTENT CHUNK %d/%d:\r\n%.900s",
+                    i + 1, num_chunks, recv_buf + (i * CHUNK_SIZE));
+
+            remaining_len -= chunk;
+        }
+    }
+}
+
     /* Parse HTTP status code */
     resp->status = parse_http_status(recv_buf);
 
@@ -804,6 +885,7 @@ int network_send_request(const char *host_ip, int port,
             }
         }
     }
+
 
     /* Calculate request latency before cleanup */
     end_time = ktime_get();

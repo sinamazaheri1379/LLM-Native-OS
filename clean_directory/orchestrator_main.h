@@ -242,6 +242,9 @@ ssize_t memory_limits_store(struct device *dev, struct device_attribute *attr,
 ssize_t context_stats_show(struct device *dev, struct device_attribute *attr, char *buf);
 bool context_management_initialized(void);
 
+int extract_openai_content(const char *json, char *output, size_t output_size);
+int extract_anthropic_content(const char *json, char *output, size_t output_size);
+int extract_gemini_content(const char *json, char *output, size_t output_size);
 /* Add to orchestrator_main.h */
 int tls_send(struct socket *sock, void *data, size_t len);
 int tls_recv(struct socket *sock, void *data, size_t len, int flags);

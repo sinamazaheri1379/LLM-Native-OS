@@ -148,7 +148,7 @@ int memory_management_init(void)
 {
     if (g_initialized) {
         pr_warn("memory_management_init: Already initialized\n");
-        return 0;
+        return 1;
     }
 
     /* Create a dedicated workqueue for memory management */

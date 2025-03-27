@@ -69,6 +69,75 @@ static int decode_unicode_escape(const char *hex, char *output, size_t output_si
 static const char *json_strcasestr(const char *haystack, const char *needle);
 static int extract_number_after_field(const char *json, const char *field_name, int *result);
 
+
+
+
+/*
+ * Decode chunked HTTP response into clean JSON
+ * Removes HTTP chunk size markers from chunked encoded responses
+ */
+static int decode_chunked_response(const char *chunked, char *output, size_t output_size)
+{
+    const char *p = chunked;
+    char *out = output;
+    size_t remaining = output_size - 1; /* Leave room for null terminator */
+    size_t out_len = 0;
+    unsigned long chunk_size;
+    int hex_len;
+    char hex_str[32]; /* Buffer for chunk size hex string */
+    int ret;
+
+    /* Look for the first chunk size marker */
+    while (*p && isspace(*p)) p++;
+
+    while (*p && remaining > 0) {
+        /* Extract hex chunk size */
+        for (hex_len = 0; hex_len < 31 && isxdigit(p[hex_len]); hex_len++) {
+            hex_str[hex_len] = p[hex_len];
+        }
+
+        if (hex_len == 0) {
+            /* No valid hex digits found, assume this isn't chunked encoding */
+            if (out_len == 0) {
+                /* No chunks processed yet, just copy everything */
+                strncpy(output, chunked, output_size - 1);
+                output[output_size - 1] = '\0';
+                return strlen(output);
+            }
+            break;
+        }
+
+        hex_str[hex_len] = '\0';
+        ret = kstrtoul(hex_str, 16, &chunk_size);
+        if (ret) {
+            pr_warn("decode_chunked_response: Invalid hex chunk size\n");
+            break;
+        }
+
+        /* Skip chunk size and CRLF */
+        p += hex_len;
+        while (*p && (*p == '\r' || *p == '\n')) p++;
+
+        /* If chunk size is zero, we're done */
+        if (chunk_size == 0) break;
+
+        /* Copy chunk data */
+        if (chunk_size > remaining) chunk_size = remaining;
+        memcpy(out, p, chunk_size);
+        out += chunk_size;
+        out_len += chunk_size;
+        remaining -= chunk_size;
+
+        /* Skip to next chunk */
+        p += chunk_size;
+        while (*p && (*p == '\r' || *p == '\n')) p++;
+    }
+
+    /* Null terminate output */
+    *out = '\0';
+
+    return out_len;
+}
 /*
  * Initialize the JSON manager subsystem
  * Returns 0 on success
@@ -630,6 +699,251 @@ static int extract_number_after_field(const char *json, const char *field_name, 
     return -EINVAL;
 }
 
+/*
+ * Extract assistant message content from OpenAI response format
+ * Specifically handles the OpenAI-style nested JSON with choices array
+ */
+int extract_openai_content(const char *json, char *output, size_t output_size)
+{
+    const char *choices_marker = "\"choices\":[";
+    const char *message_marker = "\"message\":{";
+    const char *content_marker = "\"content\":\"";
+    const char *choices_pos, *message_pos, *content_pos, *content_end;
+    int i;
+    size_t out_idx = 0;
+    bool escaped = false;
+
+    if (!json || !output || output_size == 0)
+        return -EINVAL;
+
+    /* Clear output buffer */
+    output[0] = '\0';
+
+    /* Skip chunked encoding markers if present */
+    while (*json && *json != '{' && *json != '[') {
+        json++;
+    }
+
+    /* Find the choices array */
+    choices_pos = strstr(json, choices_marker);
+    if (!choices_pos) {
+        pr_debug("extract_openai_content: Failed to find choices array\n");
+        return -EINVAL;
+    }
+
+    /* Find the message object within the first choice */
+    message_pos = strstr(choices_pos, message_marker);
+    if (!message_pos) {
+        pr_debug("extract_openai_content: Failed to find message object\n");
+        return -EINVAL;
+    }
+
+    /* Find the content field */
+    content_pos = strstr(message_pos, content_marker);
+    if (!content_pos) {
+        pr_debug("extract_openai_content: Failed to find content field\n");
+        return -EINVAL;
+    }
+
+    /* Skip past the content marker and opening quote */
+    content_pos += strlen(content_marker);
+
+    /* Find the end quote of the content, handling escaped quotes */
+    content_end = content_pos;
+    while (*content_end) {
+        if (escaped) {
+            escaped = false;
+        } else if (*content_end == '\\') {
+            escaped = true;
+        } else if (*content_end == '"') {
+            break;
+        }
+        content_end++;
+    }
+
+    if (*content_end != '"') {
+        pr_debug("extract_openai_content: Failed to find end of content\n");
+        return -EINVAL;
+    }
+
+    /* Copy and unescape content - reuse your existing code for this part */
+    for (i = 0; content_pos + i < content_end && out_idx < output_size - 1; i++) {
+        if (content_pos[i] == '\\' && i + 1 < (content_end - content_pos)) {
+            i++;
+            switch (content_pos[i]) {
+                case 'n': output[out_idx++] = '\n'; break;
+                case 'r': output[out_idx++] = '\r'; break;
+                case 't': output[out_idx++] = '\t'; break;
+                case '"': output[out_idx++] = '"'; break;
+                case '\\': output[out_idx++] = '\\'; break;
+                /* Handle other escape sequences as in your existing code */
+                default: output[out_idx++] = content_pos[i]; break;
+            }
+        } else {
+            output[out_idx++] = content_pos[i];
+        }
+    }
+
+    output[out_idx] = '\0';
+    return out_idx;
+}
+
+/*
+ * Extract content from Anthropic (Claude) response format
+ */
+int extract_anthropic_content(const char *json, char *output, size_t output_size)
+{
+    /* Anthropic has two main formats to handle */
+    const char *content_text_marker = "\"text\":\"";  /* New Claude format */
+    const char *completion_marker = "\"completion\":\"";  /* Older format */
+    const char *content_pos = NULL;
+    const char *content_end;
+    int i;
+    size_t out_idx = 0;
+    bool escaped = false;
+
+    if (!json || !output || output_size == 0)
+        return -EINVAL;
+
+    output[0] = '\0';
+
+    /* Try to find the new format with "content" array with "text" field */
+    content_pos = strstr(json, content_text_marker);
+
+    /* If not found, try the older format with "completion" field */
+    if (!content_pos) {
+        content_pos = strstr(json, completion_marker);
+        if (content_pos) {
+            content_pos += strlen(completion_marker);
+        }
+    } else {
+        content_pos += strlen(content_text_marker);
+    }
+
+    if (!content_pos) {
+        pr_debug("extract_anthropic_content: Failed to find content field\n");
+        return -EINVAL;
+    }
+
+    /* Find the end quote of the content */
+    content_end = content_pos;
+    while (*content_end) {
+        if (escaped) {
+            escaped = false;
+        } else if (*content_end == '\\') {
+            escaped = true;
+        } else if (*content_end == '"') {
+            break;
+        }
+        content_end++;
+    }
+
+    if (*content_end != '"') {
+        pr_debug("extract_anthropic_content: Failed to find end of content\n");
+        return -EINVAL;
+    }
+
+    /* Copy and unescape content */
+    for (i = 0; content_pos + i < content_end && out_idx < output_size - 1; i++) {
+        if (content_pos[i] == '\\' && i + 1 < (content_end - content_pos)) {
+            i++;
+            switch (content_pos[i]) {
+                case 'n': output[out_idx++] = '\n'; break;
+                case 'r': output[out_idx++] = '\r'; break;
+                case 't': output[out_idx++] = '\t'; break;
+                case '"': output[out_idx++] = '"'; break;
+                case '\\': output[out_idx++] = '\\'; break;
+                default: output[out_idx++] = content_pos[i]; break;
+            }
+        } else {
+            output[out_idx++] = content_pos[i];
+        }
+    }
+
+    output[out_idx] = '\0';
+    return out_idx;
+}
+
+/*
+ * Extract content from Google Gemini response format
+ */
+int extract_gemini_content(const char *json, char *output, size_t output_size)
+{
+    const char *candidates_marker = "\"candidates\":[";
+    const char *parts_marker = "\"parts\":[";
+    const char *text_marker = "\"text\":\"";
+    const char *candidates_pos, *parts_pos, *text_pos, *content_end;
+    int i;
+    size_t out_idx = 0;
+    bool escaped = false;
+
+    if (!json || !output || output_size == 0)
+        return -EINVAL;
+
+    output[0] = '\0';
+
+    /* Find the candidates array */
+    candidates_pos = strstr(json, candidates_marker);
+    if (!candidates_pos) {
+        pr_debug("extract_gemini_content: Failed to find candidates array\n");
+        return -EINVAL;
+    }
+
+    /* Find the parts array in the first candidate */
+    parts_pos = strstr(candidates_pos, parts_marker);
+    if (!parts_pos) {
+        pr_debug("extract_gemini_content: Failed to find parts array\n");
+        return -EINVAL;
+    }
+
+    /* Find the text field */
+    text_pos = strstr(parts_pos, text_marker);
+    if (!text_pos) {
+        pr_debug("extract_gemini_content: Failed to find text field\n");
+        return -EINVAL;
+    }
+
+    /* Skip past the text marker and opening quote */
+    text_pos += strlen(text_marker);
+
+    /* Find the end quote of the content */
+    content_end = text_pos;
+    while (*content_end) {
+        if (escaped) {
+            escaped = false;
+        } else if (*content_end == '\\') {
+            escaped = true;
+        } else if (*content_end == '"') {
+            break;
+        }
+        content_end++;
+    }
+
+    if (*content_end != '"') {
+        pr_debug("extract_gemini_content: Failed to find end of content\n");
+        return -EINVAL;
+    }
+
+    /* Copy and unescape content */
+    for (i = 0; text_pos + i < content_end && out_idx < output_size - 1; i++) {
+        if (text_pos[i] == '\\' && i + 1 < (content_end - text_pos)) {
+            i++;
+            switch (text_pos[i]) {
+                case 'n': output[out_idx++] = '\n'; break;
+                case 'r': output[out_idx++] = '\r'; break;
+                case 't': output[out_idx++] = '\t'; break;
+                case '"': output[out_idx++] = '"'; break;
+                case '\\': output[out_idx++] = '\\'; break;
+                default: output[out_idx++] = text_pos[i]; break;
+            }
+        } else {
+            output[out_idx++] = text_pos[i];
+        }
+    }
+
+    output[out_idx] = '\0';
+    return out_idx;
+}
 /* Fix 2: Improved JSON parsing robustness in extract_response_content() in llm_json_manager.c */
 int extract_response_content(const char *json, char *output, size_t output_size)
 {
@@ -989,4 +1303,7 @@ EXPORT_SYMBOL(append_json_number);
 EXPORT_SYMBOL(append_json_float);
 EXPORT_SYMBOL(append_json_boolean);
 EXPORT_SYMBOL(extract_response_content);
+EXPORT_SYMBOL(extract_openai_content);
+EXPORT_SYMBOL(extract_anthropic_content);
+EXPORT_SYMBOL(extract_gemini_content);
 EXPORT_SYMBOL(parse_token_count);

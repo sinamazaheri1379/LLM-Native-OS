@@ -976,11 +976,10 @@ static ssize_t orchestrator_write(struct file *file, const char __user *buf, siz
     kfree(req);
     return ret < 0 ? ret : count;
 }
-
-
 static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
     ssize_t ret;
+    char *extracted_content = NULL;
 
     mutex_lock(&orchestrator_mutex);
 
@@ -989,17 +988,66 @@ static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t cou
         return 0;
     }
 
-    if (count < global_response.content_length) {
+    /* Allocate buffer for the extracted content */
+    extracted_content = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
+    if (!extracted_content) {
+        pr_err("orchestrator_read: Failed to allocate content buffer\n");
         mutex_unlock(&orchestrator_mutex);
-        return -EINVAL;
+        return -ENOMEM;
     }
 
-    if (copy_to_user(buf, global_response.content, global_response.content_length)) {
-        mutex_unlock(&orchestrator_mutex);
-        return -EFAULT;
+    /* Choose the appropriate extractor based on the provider used */
+    switch (global_response.provider_used) {
+        case PROVIDER_OPENAI:
+            ret = extract_openai_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+            break;
+
+        case PROVIDER_ANTHROPIC:
+            ret = extract_anthropic_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+            break;
+
+        case PROVIDER_GOOGLE_GEMINI:
+            ret = extract_gemini_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+            break;
+
+        default:
+            pr_warn("orchestrator_read: Unknown provider %d, using generic extractor\n",
+                   global_response.provider_used);
+            ret = extract_response_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+            break;
     }
 
-    ret = global_response.content_length;
+    if (ret <= 0) {
+        /* If specialized extraction fails, fall back to generic extractor */
+        pr_debug("orchestrator_read: Provider-specific extractor failed, trying generic extractor\n");
+        ret = extract_response_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+    }
+
+    if (ret > 0) {
+        /* Return the extracted content */
+        if (count < ret) {
+            kfree(extracted_content);
+            mutex_unlock(&orchestrator_mutex);
+            return -EINVAL;
+        }
+
+        if (copy_to_user(buf, extracted_content, ret)) {
+            kfree(extracted_content);
+            mutex_unlock(&orchestrator_mutex);
+            return -EFAULT;
+        }
+    } else {
+        /* Fallback: return the full response if extraction failed */
+        pr_warn("orchestrator_read: Content extraction failed, returning full response\n");
+        if (copy_to_user(buf, global_response.content, global_response.content_length)) {
+            kfree(extracted_content);
+            mutex_unlock(&orchestrator_mutex);
+            return -EFAULT;
+        }
+        ret = global_response.content_length;
+    }
+
+    kfree(extracted_content);
     global_response.content_length = 0;
     mutex_unlock(&orchestrator_mutex);
     return ret;
@@ -1288,41 +1336,6 @@ static int __init orchestrator_init(void)
     set_scheduler_state(&global_scheduler);
     memset(&global_response, 0, sizeof(global_response));
     pr_info("LLM Orchestrator: Scheduler initialized\n");
-
-//    /* Step 7: Set API keys securely */
-//    if (openai_api_key && strlen(openai_api_key) > 0) {
-//        if (set_api_key(PROVIDER_OPENAI, openai_api_key) == 0) {
-//            /* Clear the module parameter after securely storing it */
-//            memzero_explicit(openai_api_key, strlen(openai_api_key));
-//       } else {
-//            pr_warn("Failed to securely store OpenAI API key\n");
-//        }
-//    } else {
-//        pr_warn("No OpenAI API key provided\n");
-//    }
-
-//    if (anthropic_api_key && strlen(anthropic_api_key) > 0) {
-//        if (set_api_key(PROVIDER_ANTHROPIC, anthropic_api_key) == 0) {
-            /* Clear the module parameter after securely storing it */
-//            memzero_explicit(anthropic_api_key, strlen(anthropic_api_key));
-//        } else {
-//            pr_warn("Failed to securely store Anthropic API key\n");
-//        }
-//    } else {
-//        pr_warn("No Anthropic API key provided\n");
-//    }
-
-//    if (google_gemini_api_key && strlen(google_gemini_api_key) > 0) {
-//        if (set_api_key(PROVIDER_GOOGLE_GEMINI, google_gemini_api_key) == 0) {
-//            /* Clear the module parameter after securely storing it */
- //           memzero_explicit(google_gemini_api_key, strlen(google_gemini_api_key));
- //       } else {
- //           pr_warn("Failed to securely store Google Gemini API key\n");
- //       }
- //   } else {
- //       pr_warn("No Google Gemini API key provided\n");
- //   }
-
     /* Step 8: Register character device */
    ret = alloc_chrdev_region(&dev, 0, 1, MODULE_NAME);
     if (ret < 0) {
