@@ -72,71 +72,70 @@ static int extract_number_after_field(const char *json, const char *field_name, 
 
 
 
-/*
- * Decode chunked HTTP response into clean JSON
- * Removes HTTP chunk size markers from chunked encoded responses
- */
 static int decode_chunked_response(const char *chunked, char *output, size_t output_size)
 {
     const char *p = chunked;
     char *out = output;
-    size_t remaining = output_size - 1; /* Leave room for null terminator */
+    size_t remaining_out = output_size - 1; /* Leave room for null terminator */
     size_t out_len = 0;
-    unsigned long chunk_size;
-    int hex_len;
-    char hex_str[32]; /* Buffer for chunk size hex string */
-    int ret;
 
-    /* Look for the first chunk size marker */
-    while (*p && isspace(*p)) p++;
+    /* Skip any leading whitespace or control chars */
+    while (*p && (*p <= ' ' || !isprint(*p))) p++;
 
-    while (*p && remaining > 0) {
+    while (*p && remaining_out > 0) {
         /* Extract hex chunk size */
-        for (hex_len = 0; hex_len < 31 && isxdigit(p[hex_len]); hex_len++) {
-            hex_str[hex_len] = p[hex_len];
-        }
+        char hex_str[16] = {0};
+        int hex_idx = 0;
+        size_t chunk_size = 0;
 
-        if (hex_len == 0) {
-            /* No valid hex digits found, assume this isn't chunked encoding */
-            if (out_len == 0) {
-                /* No chunks processed yet, just copy everything */
-                strncpy(output, chunked, output_size - 1);
-                output[output_size - 1] = '\0';
-                return strlen(output);
+        /* Read hex digits until non-hex character */
+        while (isxdigit(*p) && hex_idx < 15) {
+            hex_str[hex_idx++] = *p++;
+        }
+        hex_str[hex_idx] = '\0';
+
+        /* Convert hex string to number */
+        if (hex_idx > 0) {
+            if (kstrtoul(hex_str, 16, &chunk_size) != 0) {
+                pr_warn("decode_chunked_response: Invalid hex chunk size: %s\n", hex_str);
+                break;
             }
+        } else {
+            /* No valid hex digits found, assume not chunked */
+            return -EINVAL;
+        }
+
+        /* Skip CRLF after chunk size */
+        while (*p && (*p == '\r' || *p == '\n' || *p == ' ')) p++;
+
+        /* If chunk size is 0, we've reached the end */
+        if (chunk_size == 0) {
             break;
         }
 
-        hex_str[hex_len] = '\0';
-        ret = kstrtoul(hex_str, 16, &chunk_size);
-        if (ret) {
-            pr_warn("decode_chunked_response: Invalid hex chunk size\n");
-            break;
+        /* Copy chunk data (limiting to available output space) */
+        if (chunk_size > remaining_out) {
+            chunk_size = remaining_out;
         }
 
-        /* Skip chunk size and CRLF */
-        p += hex_len;
-        while (*p && (*p == '\r' || *p == '\n')) p++;
-
-        /* If chunk size is zero, we're done */
-        if (chunk_size == 0) break;
-
-        /* Copy chunk data */
-        if (chunk_size > remaining) chunk_size = remaining;
+        /* Ensure we don't read past the end of the input */
         memcpy(out, p, chunk_size);
         out += chunk_size;
         out_len += chunk_size;
-        remaining -= chunk_size;
-
-        /* Skip to next chunk */
+        remaining_out -= chunk_size;
         p += chunk_size;
+
+        /* Skip CRLF after chunk data */
         while (*p && (*p == '\r' || *p == '\n')) p++;
     }
 
-    /* Null terminate output */
+    /* Null terminate the output */
     *out = '\0';
 
-    return out_len;
+    /* Debug output */
+    pr_debug("decode_chunked_response: Successfully decoded %zu bytes\n", out_len);
+
+    return out_len > 0 ? out_len : -EINVAL;
 }
 /*
  * Initialize the JSON manager subsystem
@@ -657,6 +656,43 @@ bool validate_json(const char *json)
     return (depth == 0) && !in_string;
 }
 
+void display_content(char* contents){
+        /* Create a copy of the body pointer for debugging */
+        char *debug_body = contents; /* Skip past header separator */
+
+        /* Get body length */
+        size_t body_len = strlen(debug_body);
+        size_t remaining = body_len;
+        size_t offset = 0;
+
+        /* Use static buffer to avoid stack overflow */
+        static char tmp_buf[DEBUG_CHUNK_SIZE + 1];
+
+        pr_info("=================== RESPONSE BODY DUMP ===================\n");
+
+        while (remaining > 0) {
+            /* Print in chunks to avoid overwhelming kernel log buffer */
+            size_t chunk_size = (remaining > DEBUG_CHUNK_SIZE) ? DEBUG_CHUNK_SIZE : remaining;
+
+            /* Copy chunk to temporary buffer and null-terminate */
+            memcpy(tmp_buf, debug_body + offset, chunk_size);
+            tmp_buf[chunk_size] = '\0';
+
+            /* Print this chunk */
+            pr_info("BODY CHUNK %zu/%zu:\n%s\n",
+                    offset/DEBUG_CHUNK_SIZE + 1,
+                    (body_len + DEBUG_CHUNK_SIZE - 1)/DEBUG_CHUNK_SIZE,
+                    tmp_buf);
+
+            /* Update counters */
+            offset += chunk_size;
+            remaining -= chunk_size;
+        }
+        pr_info("============== END OF RESPONSE BODY DUMP ================\n");
+
+}
+
+
 /*
  * Helper function to extract numeric value after a field
  * Returns 0 on success, negative error code on failure
@@ -710,11 +746,11 @@ static int extract_number_after_field(const char *json, const char *field_name, 
 int extract_openai_content(const char *json, char *output, size_t output_size)
 {
     char *decoded_json = NULL;
-    const char *choices_marker = "\"choices\":[";
-    const char *message_marker = "\"message\":{";
-    const char *content_marker = "\"content\":\"";
-    const char *choices_pos, *message_pos, *content_pos, *content_end;
-    int i, result = -EINVAL;
+    int decoded_len = 0;
+    const char *json_to_use;
+    const char *content_start = NULL;
+    const char *content_end = NULL;
+    int ret = -EINVAL;
     size_t out_idx = 0;
     bool escaped = false;
 
@@ -724,50 +760,44 @@ int extract_openai_content(const char *json, char *output, size_t output_size)
     /* Clear output buffer */
     output[0] = '\0';
 
-    /* First, allocate a buffer for the decoded JSON */
+    /* Allocate buffer for decoded JSON */
     decoded_json = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
-    if (!decoded_json) {
-        pr_err("extract_openai_content: Failed to allocate decode buffer\n");
+    if (!decoded_json)
         return -ENOMEM;
-    }
 
     /* Decode chunked encoding if present */
-    if (decode_chunked_response(json, decoded_json, MAX_RESPONSE_LENGTH) <= 0) {
-        /* Decoding failed or unnecessary, use original */
-        pr_debug("extract_openai_content: Chunk decoding failed, using original\n");
-        strncpy(decoded_json, json, MAX_RESPONSE_LENGTH - 1);
-        decoded_json[MAX_RESPONSE_LENGTH - 1] = '\0';
-    }
+    decoded_len = decode_chunked_response(json, decoded_json, MAX_RESPONSE_LENGTH);
 
-    /* Find the choices array */
-    choices_pos = strstr(decoded_json, choices_marker);
-    if (!choices_pos) {
-        pr_debug("extract_openai_content: Failed to find choices array\n");
-        result = -EINVAL;
+    /* Determine which JSON to parse */
+    if (decoded_len > 0) {
+        json_to_use = decoded_json;
+        pr_debug("Using decoded JSON (%d bytes)\n", decoded_len);
+    } else {
+        json_to_use = json;
+        pr_debug("Using original JSON\n");
+    }
+	display_content((char*) json_to_use);
+    /* Look for choices array in a more direct way */
+    const char *choices = strstr(json_to_use, "\"choices\"");
+    if (!choices) {
+        pr_debug("No choices field found\n");
+        ret = -EINVAL;
         goto cleanup;
     }
-
-    /* Find the message object within the first choice */
-    message_pos = strstr(choices_pos, message_marker);
-    if (!message_pos) {
-        pr_debug("extract_openai_content: Failed to find message object\n");
-        result = -EINVAL;
+	display_content((char*) choices);
+    /* Find the content field - search for "content":" directly */
+    content_start = strstr(choices, "\"content\"");
+    if (!content_start) {
+        pr_debug("No content field found\n");
+        ret = -EINVAL;
         goto cleanup;
     }
+	display_content((char*) content_start);
+    /* Skip past "content":" */
+    content_start += 12; /* Length of "content":" */
 
-    /* Find the content field */
-    content_pos = strstr(message_pos, content_marker);
-    if (!content_pos) {
-        pr_debug("extract_openai_content: Failed to find content field\n");
-        result = -EINVAL;
-        goto cleanup;
-    }
-
-    /* Skip past the content marker and opening quote */
-    content_pos += strlen(content_marker);
-
-    /* Find the end quote of the content, handling escaped quotes */
-    content_end = content_pos;
+    /* Find the closing quote, handling escaped quotes */
+    content_end = content_start;
     while (*content_end) {
         if (escaped) {
             escaped = false;
@@ -780,16 +810,16 @@ int extract_openai_content(const char *json, char *output, size_t output_size)
     }
 
     if (*content_end != '"') {
-        pr_debug("extract_openai_content: Failed to find end of content\n");
-        result = -EINVAL;
+        pr_debug("No closing quote found for content\n");
+        ret = -EINVAL;
         goto cleanup;
     }
-
-    /* Copy and unescape content */
-    for (i = 0; content_pos + i < content_end && out_idx < output_size - 1; i++) {
-        if (content_pos[i] == '\\' && i + 1 < (content_end - content_pos)) {
-            i++;
-            switch (content_pos[i]) {
+	display_content((char*) content_end);
+    /* Copy and unescape the content */
+    while (content_start < content_end && out_idx < output_size - 1) {
+        if (*content_start == '\\' && content_start + 1 < content_end) {
+            content_start++;
+            switch (*content_start) {
                 case 'n': output[out_idx++] = '\n'; break;
                 case 'r': output[out_idx++] = '\r'; break;
                 case 't': output[out_idx++] = '\t'; break;
@@ -797,25 +827,20 @@ int extract_openai_content(const char *json, char *output, size_t output_size)
                 case 'f': output[out_idx++] = '\f'; break;
                 case '"': output[out_idx++] = '"'; break;
                 case '\\': output[out_idx++] = '\\'; break;
-                case 'u': /* Unicode escape - simplified handling */
-                    output[out_idx++] = '?'; /* Placeholder for Unicode */
-                    i += 4; /* Skip past the 4 hex digits */
-                    break;
-                default: output[out_idx++] = content_pos[i]; break;
+                default: output[out_idx++] = *content_start;
             }
         } else {
-            output[out_idx++] = content_pos[i];
+            output[out_idx++] = *content_start;
         }
+        content_start++;
     }
-
     output[out_idx] = '\0';
-    result = out_idx;
-
+    ret = out_idx;
 cleanup:
     if (decoded_json)
         kfree(decoded_json);
 
-    return result;
+    return ret;
 }
 
 /*

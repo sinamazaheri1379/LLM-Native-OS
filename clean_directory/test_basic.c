@@ -88,7 +88,7 @@ void *request_thread(void *arg) {
     req.scheduler_algorithm = data->scheduler_algorithm;
     req.priority = 50;          /* Medium priority */
 
-    printf("[Thread %d] Sending request: %.40s...\n",
+    printf("[Thread %d] Sending request: %s\n",
            data->thread_id, req.prompt);
 
     /* Send request to device */
@@ -111,7 +111,7 @@ void *request_thread(void *arg) {
         printf("[Thread %d] No response received\n", data->thread_id);
     } else {
         response[bytes_read] = '\0';
-        printf("[Thread %d] Response received (%zd bytes): %.100s...\n",
+        printf("[Thread %d] Response received (%zd bytes): %s\n",
                data->thread_id, bytes_read, response);
     }
 

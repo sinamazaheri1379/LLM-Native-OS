@@ -29,7 +29,7 @@
 #define LLM_ERR_RATE_LIMIT 100
 #define LLM_ERR_AUTH 101
 #define LLM_ERR_API_RESPONSE 102
-
+#define DEBUG_CHUNK_SIZE 512  /* Reduced from 1024 */
 /* Provider definitions */
 #define PROVIDER_COUNT 3
 #define PROVIDER_OPENAI 0
@@ -163,7 +163,7 @@ int context_set_memory_limits(size_t max_total, size_t max_per_conversation,
 void context_cleanup_memory_tracking(void);
 struct context_entry *context_allocate_entry(int conversation_id);
 void context_free_entry(int conversation_id, struct context_entry *entry);
-
+void display_content(char* content);
 /* JSON utility functions */
 int json_buffer_init(struct llm_json_buffer *buf, size_t size);
 void json_buffer_free(struct llm_json_buffer *buf);

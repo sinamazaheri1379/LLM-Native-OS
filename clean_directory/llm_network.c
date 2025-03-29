@@ -773,9 +773,9 @@ int network_send_request(const char *host_ip, int port,
     /* Extract response body regardless of status */
     {
         char *body = strstr(recv_buf, "\r\n\r\n");
+		/* Print just the response body for debugging */
         if (body) {
             body += 4; /* Skip past header separator */
-			pr_info();
             /* Copy response body with size limit */
             size_t body_len = strlen(body);
             size_t copy_len = min_t(size_t, body_len, MAX_RESPONSE_LENGTH - 1);
@@ -783,12 +783,14 @@ int network_send_request(const char *host_ip, int port,
             memcpy(resp->content, body, copy_len);
             resp->content[copy_len] = '\0';
             resp->content_length = copy_len;
-			pr_info("IF length: %zu ,BODY: %s", resp->content_length, resp->content);
+
             /* Try to parse token count if available */
             {
                 int prompt_tokens = 0, completion_tokens = 0, total_tokens = 0;
-                if (parse_token_count(body, &prompt_tokens, &completion_tokens, &total_tokens) == 0)
+                if (parse_token_count(body, &prompt_tokens, &completion_tokens, &total_tokens) == 0){
                     resp->tokens_used = total_tokens;
+                    pr_info("Total tokens: %d\n", resp->tokens_used);
+                   }
             }
         } else {
             /* If we can't find the body separator, use the whole response (likely invalid) */
@@ -797,12 +799,12 @@ int network_send_request(const char *host_ip, int port,
             memcpy(resp->content, recv_buf, copy_len);
             resp->content[copy_len] = '\0';
             resp->content_length = copy_len;
-			pr_info("ELSE length: %zu, BODY: %s", resp->content_length, resp->content);
             /* If no body found but we have a success status, something's wrong */
             if (resp->status >= 200 && resp->status < 300) {
                 pr_warn("network_send_request: No response body found despite success status\n");
             }
         }
+        display_content(resp->content);
     }
 
 

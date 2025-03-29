@@ -11,7 +11,7 @@ KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
 # Compiler flags
-ccflags-y := -Wall -Werror -Wextra -Wno-unused-parameter -std=gnu99
+ccflags-y := -Wall -Werror -Wextra -Wno-unused-parameter -std=gnu99 -g -DDEBUG
 
 # Check for kernel version to determine TLS support
 KERNEL_VERSION_CODE := $(shell grep UTS_RELEASE $(KERNELDIR)/include/generated/utsrelease.h | cut -d '"' -f2 | awk -F. '{ printf("%d%02d%02d", $$1, $$2, $$3); }')
