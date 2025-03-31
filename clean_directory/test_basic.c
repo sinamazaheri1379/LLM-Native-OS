@@ -144,7 +144,7 @@ int main() {
     thread_data_array[2].prompt = "What are the main features of Linux kernel modules?";
 
     /* Create threads */
-    for (i = 0; i < 1; i++) {
+    for (i = 0; i < 3; i++) {
         ret = pthread_create(&threads[i], NULL, request_thread, &thread_data_array[i]);
         if (ret) {
             printf("Error creating thread %d: %s\n", i + 1, strerror(ret));
@@ -153,7 +153,7 @@ int main() {
     }
 
     /* Wait for threads to complete */
-    for (i = 0; i < 1; i++) {
+    for (i = 0; i < 3; i++) {
         pthread_join(threads[i], NULL);
     }
 
