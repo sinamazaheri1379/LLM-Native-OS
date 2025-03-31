@@ -18,7 +18,7 @@
 /* Provider model information */
 static const char *openai_default_model = "gpt-4o";
 static const char *anthropic_default_model = "claude-3-7-sonnet-20250219";
-static const char *gemini_default_model = "gemini-2.0-flash";
+static const char *gemini_default_model = "gemini-1.5-pro";
 
 static const char *openai_supported_models[] = {
         "gpt-4o", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo", NULL

@@ -843,18 +843,15 @@ cleanup:
     return ret;
 }
 
-/*
- * Extract content from Anthropic (Claude) response format
- * Handles chunked transfer encoding
- */
 int extract_anthropic_content(const char *json, char *output, size_t output_size)
 {
     char *decoded_json = NULL;
-    const char *content_text_marker = "\"text\":\"";  /* New Claude format */
+    const char *content_array_marker = "\"content\":[";
+    const char *text_obj_marker = "\"text\":\"";
     const char *completion_marker = "\"completion\":\"";  /* Older format */
     const char *content_pos = NULL;
     const char *content_end;
-    int i, result = -EINVAL;
+    int result = -EINVAL;
     size_t out_idx = 0;
     bool escaped = false;
 
@@ -863,23 +860,30 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
 
     output[0] = '\0';
 
-    /* First, allocate a buffer for the decoded JSON */
+    /* Allocate buffer for decoded JSON */
     decoded_json = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
-    if (!decoded_json) {
-        pr_err("extract_anthropic_content: Failed to allocate decode buffer\n");
+    if (!decoded_json)
         return -ENOMEM;
-    }
 
     /* Decode chunked encoding if present */
     if (decode_chunked_response(json, decoded_json, MAX_RESPONSE_LENGTH) <= 0) {
-        /* Decoding failed or unnecessary, use original */
-        pr_debug("extract_anthropic_content: Chunk decoding failed, using original\n");
+        /* Use original */
         strncpy(decoded_json, json, MAX_RESPONSE_LENGTH - 1);
         decoded_json[MAX_RESPONSE_LENGTH - 1] = '\0';
     }
 
-    /* Try to find the new format with "content" array with "text" field */
-    content_pos = strstr(decoded_json, content_text_marker);
+    /* For debugging - print the decoded JSON */
+    pr_debug("Anthropic JSON: %.40s...\n", decoded_json);
+
+    /* Try the new content array format first */
+    const char *content_array = strstr(decoded_json, content_array_marker);
+    if (content_array) {
+        /* Find the first text object in the content array */
+        const char *text_obj = strstr(content_array, text_obj_marker);
+        if (text_obj) {
+            content_pos = text_obj + strlen(text_obj_marker);
+        }
+    }
 
     /* If not found, try the older format with "completion" field */
     if (!content_pos) {
@@ -887,8 +891,6 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
         if (content_pos) {
             content_pos += strlen(completion_marker);
         }
-    } else {
-        content_pos += strlen(content_text_marker);
     }
 
     if (!content_pos) {
@@ -917,10 +919,11 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
     }
 
     /* Copy and unescape content */
-    for (i = 0; content_pos + i < content_end && out_idx < output_size - 1; i++) {
-        if (content_pos[i] == '\\' && i + 1 < (content_end - content_pos)) {
-            i++;
-            switch (content_pos[i]) {
+    const char *content_ptr = content_pos;
+    while (content_ptr < content_end && out_idx < output_size - 1) {
+        if (*content_ptr == '\\' && content_ptr + 1 < content_end) {
+            content_ptr++;
+            switch (*content_ptr) {
                 case 'n': output[out_idx++] = '\n'; break;
                 case 'r': output[out_idx++] = '\r'; break;
                 case 't': output[out_idx++] = '\t'; break;
@@ -928,15 +931,13 @@ int extract_anthropic_content(const char *json, char *output, size_t output_size
                 case 'f': output[out_idx++] = '\f'; break;
                 case '"': output[out_idx++] = '"'; break;
                 case '\\': output[out_idx++] = '\\'; break;
-                case 'u': /* Unicode escape - simplified handling */
-                    output[out_idx++] = '?'; /* Placeholder for Unicode */
-                    i += 4; /* Skip past the 4 hex digits */
-                    break;
-                default: output[out_idx++] = content_pos[i]; break;
+                case 'u': output[out_idx++] = '?'; break;
+                default: output[out_idx++] = *content_ptr; break;
             }
         } else {
-            output[out_idx++] = content_pos[i];
+            output[out_idx++] = *content_ptr;
         }
+        content_ptr++;
     }
 
     output[out_idx] = '\0';
@@ -953,14 +954,22 @@ cleanup:
  * Extract content from Google Gemini response format
  * Handles chunked transfer encoding
  */
+/*
+ * Extract content from Google Gemini response format (v1 API)
+ * Uses newest response format with candidates->content->parts->text structure
+ */
 int extract_gemini_content(const char *json, char *output, size_t output_size)
 {
     char *decoded_json = NULL;
-    const char *candidates_marker = "\"candidates\":[";
-    const char *parts_marker = "\"parts\":[";
+    int decoded_len = 0;
+    const char *candidates_marker = "\"candidates\":[{";
+    const char *content_marker = "\"content\":{";
+    const char *parts_marker = "\"parts\":[{";
     const char *text_marker = "\"text\":\"";
-    const char *candidates_pos, *parts_pos, *text_pos, *content_end;
-    int i, result = -EINVAL;
+    const char *json_to_use;
+    const char *content_pos = NULL;
+    const char *content_end;
+    int ret = -EINVAL;
     size_t out_idx = 0;
     bool escaped = false;
 
@@ -969,50 +978,58 @@ int extract_gemini_content(const char *json, char *output, size_t output_size)
 
     output[0] = '\0';
 
-    /* First, allocate a buffer for the decoded JSON */
+    /* Allocate buffer for decoded JSON */
     decoded_json = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
-    if (!decoded_json) {
-        pr_err("extract_gemini_content: Failed to allocate decode buffer\n");
+    if (!decoded_json)
         return -ENOMEM;
-    }
 
     /* Decode chunked encoding if present */
-    if (decode_chunked_response(json, decoded_json, MAX_RESPONSE_LENGTH) <= 0) {
-        /* Decoding failed or unnecessary, use original */
-        pr_debug("extract_gemini_content: Chunk decoding failed, using original\n");
-        strncpy(decoded_json, json, MAX_RESPONSE_LENGTH - 1);
-        decoded_json[MAX_RESPONSE_LENGTH - 1] = '\0';
+    decoded_len = decode_chunked_response(json, decoded_json, MAX_RESPONSE_LENGTH);
+
+    /* Determine which JSON to parse */
+    if (decoded_len > 0) {
+        json_to_use = decoded_json;
+        pr_debug("Using decoded Gemini JSON (%d bytes)\n", decoded_len);
+    } else {
+        json_to_use = json;
+        pr_debug("Using original Gemini JSON\n");
     }
 
-    /* Find the candidates array */
-    candidates_pos = strstr(decoded_json, candidates_marker);
-    if (!candidates_pos) {
-        pr_debug("extract_gemini_content: Failed to find candidates array\n");
-        result = -EINVAL;
+    /* Navigate through the nested structure */
+    const char *candidates = strstr(json_to_use, candidates_marker);
+    if (!candidates) {
+        pr_debug("No candidates array found in Gemini response\n");
+        ret = -EINVAL;
         goto cleanup;
     }
 
-    /* Find the parts array in the first candidate */
-    parts_pos = strstr(candidates_pos, parts_marker);
-    if (!parts_pos) {
-        pr_debug("extract_gemini_content: Failed to find parts array\n");
-        result = -EINVAL;
+    const char *content = strstr(candidates, content_marker);
+    if (!content) {
+        pr_debug("No content object found in Gemini response\n");
+        ret = -EINVAL;
+        goto cleanup;
+    }
+
+    const char *parts = strstr(content, parts_marker);
+    if (!parts) {
+        pr_debug("No parts array found in Gemini response\n");
+        ret = -EINVAL;
         goto cleanup;
     }
 
     /* Find the text field */
-    text_pos = strstr(parts_pos, text_marker);
-    if (!text_pos) {
-        pr_debug("extract_gemini_content: Failed to find text field\n");
-        result = -EINVAL;
+    const char *text = strstr(parts, text_marker);
+    if (!text) {
+        pr_debug("No text field found in Gemini response\n");
+        ret = -EINVAL;
         goto cleanup;
     }
 
     /* Skip past the text marker and opening quote */
-    text_pos += strlen(text_marker);
+    content_pos = text + strlen(text_marker);
 
-    /* Find the end quote of the content */
-    content_end = text_pos;
+    /* Find the closing quote, handling escaped quotes */
+    content_end = content_pos;
     while (*content_end) {
         if (escaped) {
             escaped = false;
@@ -1025,16 +1042,17 @@ int extract_gemini_content(const char *json, char *output, size_t output_size)
     }
 
     if (*content_end != '"') {
-        pr_debug("extract_gemini_content: Failed to find end of content\n");
-        result = -EINVAL;
+        pr_debug("No closing quote found for Gemini content\n");
+        ret = -EINVAL;
         goto cleanup;
     }
 
     /* Copy and unescape content */
-    for (i = 0; text_pos + i < content_end && out_idx < output_size - 1; i++) {
-        if (text_pos[i] == '\\' && i + 1 < (content_end - text_pos)) {
-            i++;
-            switch (text_pos[i]) {
+    const char *content_ptr = content_pos;
+    while (content_ptr < content_end && out_idx < output_size - 1) {
+        if (*content_ptr == '\\' && content_ptr + 1 < content_end) {
+            content_ptr++;
+            switch (*content_ptr) {
                 case 'n': output[out_idx++] = '\n'; break;
                 case 'r': output[out_idx++] = '\r'; break;
                 case 't': output[out_idx++] = '\t'; break;
@@ -1044,23 +1062,24 @@ int extract_gemini_content(const char *json, char *output, size_t output_size)
                 case '\\': output[out_idx++] = '\\'; break;
                 case 'u': /* Unicode escape - simplified handling */
                     output[out_idx++] = '?'; /* Placeholder for Unicode */
-                    i += 4; /* Skip past the 4 hex digits */
+                    content_ptr += 4; /* Skip past the 4 hex digits */
                     break;
-                default: output[out_idx++] = text_pos[i]; break;
+                default: output[out_idx++] = *content_ptr; break;
             }
         } else {
-            output[out_idx++] = text_pos[i];
+            output[out_idx++] = *content_ptr;
         }
+        content_ptr++;
     }
 
     output[out_idx] = '\0';
-    result = out_idx;
+    ret = out_idx;
 
 cleanup:
     if (decoded_json)
         kfree(decoded_json);
 
-    return result;
+    return ret;
 }
 /* Fix 2: Improved JSON parsing robustness in extract_response_content() in llm_json_manager.c */
 int extract_response_content(const char *json, char *output, size_t output_size)

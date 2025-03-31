@@ -76,7 +76,7 @@ struct scheduler_registry_entry {
 struct llm_provider_config provider_configs[PROVIDER_COUNT] = {
     { "api.openai.com", "127.0.0.1", 8080, "/openai/v1/chat/completions" },      /* OpenAI */
     { "api.anthropic.com", "127.0.0.1", 8080, "/anthropic/v1/messages" },           /* Anthropic */
-    { "generativelanguage.googleapis.com", "127.0.0.1", 8080, "/gemini/v1/models/gemini-pro:generateContent" } /* Gemini */
+    { "generativelanguage.googleapis.com", "127.0.0.1", 8080, "/gemini/v1/models/gemini-1.5-pro:generateContent" } /* Gemini */
 };
 
 /* Function to get provider configuration */
@@ -840,12 +840,15 @@ static int orchestrate_request(struct llm_request *req, struct llm_response *res
 
         switch (provider) {
             case PROVIDER_OPENAI:
+              	pr_info("Enter OPenAI");
                 ret = llm_send_openai(openai_api_key, req, resp);
                 break;
             case PROVIDER_ANTHROPIC:
+              	pr_info("Enter ANthropic");
                 ret = llm_send_anthropic(anthropic_api_key, req, resp);
                 break;
             case PROVIDER_GOOGLE_GEMINI:
+              	pr_info("Enter Gemini");
                 ret = llm_send_google_gemini(google_gemini_api_key, req, resp);
                 break;
             default:
@@ -999,14 +1002,17 @@ static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t cou
     /* Choose the appropriate extractor based on the provider used */
     switch (global_response.provider_used) {
         case PROVIDER_OPENAI:
+          pr_debug("Providing OpenAIS\n");
             ret = extract_openai_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
             break;
 
         case PROVIDER_ANTHROPIC:
+          pr_info("Providing anthrotropic\n");
             ret = extract_anthropic_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
             break;
 
         case PROVIDER_GOOGLE_GEMINI:
+          pr_info("Providing Google Mini\n");
             ret = extract_gemini_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
             break;
 
