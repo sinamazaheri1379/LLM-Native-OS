@@ -77,6 +77,7 @@ struct llm_request {
     unsigned long timeout_ms;
     int scheduler_algorithm;
     int priority;
+    int provider_override;  /* New field for preferred provider */
 };
 
 struct llm_response {
@@ -138,6 +139,20 @@ struct scheduler_state {
     int next_provider;
     struct fifo_queue fifo;
     bool auto_adjust;
+};
+
+struct llm_response_wrapper {
+    struct llm_response resp;   /* Response data specific to this file */
+    int request_id;             /* Unique ID for tracking */
+    atomic_t completed;         /* Completion flag */
+    int priority;               /* Request priority level */
+    int preferred_provider;     /* Preferred provider for this file */
+};
+
+/* Add to struct file_operations */
+struct llm_response_wrapper {
+    struct llm_response resp;
+    /* Add other per-file data if needed */
 };
 bool is_ip_address_valid(const char *ip);
 struct llm_provider_config *get_provider_config(int provider_id);

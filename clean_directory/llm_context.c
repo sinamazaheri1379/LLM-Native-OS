@@ -1,3 +1,7 @@
+/*
+ * llm_context.c - Context management with hash table implementation
+ */
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
@@ -5,14 +9,8 @@
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
 #include <linux/ratelimit.h>
+#include <linux/hashtable.h>
 #include "orchestrator_main.h"
-
-/*
- * Locking hierarchy:
- * 1. conversations_lock (global)
- * 2. ctx->lock (per-conversation)
- * Always acquire locks in this order to prevent deadlocks.
- */
 
 /* Statistics for monitoring */
 static atomic_t entries_added = ATOMIC_INIT(0);
@@ -23,17 +21,17 @@ static atomic_t json_generated = ATOMIC_INIT(0);
 /* Rate limiting for debug logs */
 static DEFINE_RATELIMIT_STATE(ratelimit_state, 5 * HZ, 10);
 
-/* Global list of conversation contexts */
-static LIST_HEAD(conversation_list);
-DEFINE_SPINLOCK(conversations_lock);
+/* Hash table for conversation contexts - 8 bits = 256 buckets */
+DEFINE_HASHTABLE(conversation_table, 8);
+DEFINE_SPINLOCK(conversations_lock); /* Global lock for hash table operations */
 static bool context_initialized = false;
 
-/* Find a conversation context by ID */
+/* Find a conversation context by ID - O(1) operation with hash table */
 struct conversation_context *find_conversation_internal(int conversation_id)
 {
     struct conversation_context *ctx;
 
-    list_for_each_entry(ctx, &conversation_list, list) {
+    hash_for_each_possible(conversation_table, ctx, hnode, conversation_id) {
         if (ctx->conversation_id == conversation_id)
             return ctx;
     }
@@ -52,7 +50,7 @@ static struct conversation_context *create_conversation(int conversation_id)
     struct conversation_context *ctx;
 
     /* Check if memory management is initialized */
-    if (!memory_management_init()) {
+    if (!memory_management_initialized()) {
         pr_warn("create_conversation: Memory management not initialized\n");
         return NULL;
     }
@@ -127,7 +125,8 @@ int context_add_entry(int conversation_id, const char *role, const char *content
             spin_unlock_irqrestore(&conversations_lock, flags);
             return -ENOMEM;
         }
-        list_add(&ctx->list, &conversation_list);
+        /* Add to hash table instead of linked list */
+        hash_add(conversation_table, &ctx->hnode, conversation_id);
     }
     spin_unlock_irqrestore(&conversations_lock, flags);
 
@@ -189,7 +188,6 @@ int context_add_entry(int conversation_id, const char *role, const char *content
     return 0;
 }
 
-/* Fix 1: Correct memory leak in context_get_conversation() in llm_context.c */
 int context_get_conversation(int conversation_id, struct llm_json_buffer *json_buf)
 {
     struct conversation_context *ctx;
@@ -298,7 +296,6 @@ int context_get_conversation(int conversation_id, struct llm_json_buffer *json_b
     return ret;
 }
 
-
 /* Get entry count */
 int context_get_entry_count(int conversation_id)
 {
@@ -379,10 +376,12 @@ int context_clear_conversation(int conversation_id)
 /* Prune old conversations with improved locking */
 int context_prune_old_conversations(unsigned long age_threshold_ms)
 {
-    struct conversation_context *ctx, *tmp_ctx;
+    struct conversation_context *ctx;
     unsigned long flags;
     ktime_t cutoff_time;
     int pruned = 0;
+    struct hlist_node *tmp;
+    int i;
 
     /* Check initialization */
     if (!context_initialized)
@@ -392,27 +391,14 @@ int context_prune_old_conversations(unsigned long age_threshold_ms)
 
     spin_lock_irqsave(&conversations_lock, flags);
 
-    /* First pass: identify old conversations without modifying the list */
-    list_for_each_entry(ctx, &conversation_list, list) {
-        if (ktime_before(ctx->last_updated, cutoff_time))
-            pruned++;
-    }
-
-    if (pruned == 0) {
-        /* Early exit if no conversations need pruning */
-        spin_unlock_irqrestore(&conversations_lock, flags);
-        return 0;
-    }
-
-    /* Second pass: remove old conversations */
-    pruned = 0;
-    list_for_each_entry_safe(ctx, tmp_ctx, &conversation_list, list) {
+    /* Safely iterate through hash table */
+    hash_for_each_safe(conversation_table, i, tmp, ctx, hnode) {
         if (ktime_before(ctx->last_updated, cutoff_time)) {
             struct context_entry *entry, *tmp_entry;
             int conversation_id = ctx->conversation_id;
 
-            /* Remove from global list first */
-            list_del(&ctx->list);
+            /* Remove from hash table */
+            hash_del(&ctx->hnode);
 
             /* Release global lock before handling entries */
             spin_unlock_irqrestore(&conversations_lock, flags);
@@ -451,58 +437,57 @@ int context_prune_old_conversations(unsigned long age_threshold_ms)
     return pruned;
 }
 
-/* Fix 1: Correct lock hierarchy violation in context_cleanup_all() in llm_context.c */
 void context_cleanup_all(void)
 {
-    struct conversation_context *ctx, *tmp_ctx;
+    struct conversation_context *ctx;
     unsigned long flags;
     int count = 0;
-    struct list_head temp_list;
+    struct hlist_node *tmp;
+    int i;
 
     /* Even if not initialized, try to clean up */
     context_initialized = false;
 
-    INIT_LIST_HEAD(&temp_list);
-
-    /* First, unlink all contexts from the global list with proper locking */
+    /* Safely iterate through hash table */
     spin_lock_irqsave(&conversations_lock, flags);
-    list_for_each_entry(ctx, &conversation_list, list) {
-        count++;
-    }
-    list_splice_init(&conversation_list, &temp_list);
-    spin_unlock_irqrestore(&conversations_lock, flags);
 
-    /* Now process each context without holding the global lock */
-    list_for_each_entry_safe(ctx, tmp_ctx, &temp_list, list) {
+    hash_for_each_safe(conversation_table, i, tmp, ctx, hnode) {
         struct context_entry *entry, *tmp_entry;
         int conversation_id = ctx->conversation_id;
-        unsigned long ctx_flags;
 
-        /* Remove from temp list */
-        list_del(&ctx->list);
+        /* Remove from hash table */
+        hash_del(&ctx->hnode);
+        count++;
+
+        /* Release global lock before handling entries */
+        spin_unlock_irqrestore(&conversations_lock, flags);
 
         /* Process entries with conversation lock */
-        spin_lock_irqsave(&ctx->lock, ctx_flags);
+        spin_lock_irqsave(&ctx->lock, flags);
         list_for_each_entry_safe(entry, tmp_entry, &ctx->entries, list) {
             list_del(&entry->list);
             /* Release lock before freeing */
-            spin_unlock_irqrestore(&ctx->lock, ctx_flags);
+            spin_unlock_irqrestore(&ctx->lock, flags);
 
             context_free_entry(conversation_id, entry);
 
             /* Reacquire lock to continue */
-            spin_lock_irqsave(&ctx->lock, ctx_flags);
+            spin_lock_irqsave(&ctx->lock, flags);
         }
-        spin_unlock_irqrestore(&ctx->lock, ctx_flags);
+        spin_unlock_irqrestore(&ctx->lock, flags);
 
         /* Free conversation */
         context_unregister_memory(conversation_id, sizeof(*ctx));
         kfree(ctx);
+
+        /* Reacquire global lock to continue iteration */
+        spin_lock_irqsave(&conversations_lock, flags);
     }
+
+    spin_unlock_irqrestore(&conversations_lock, flags);
 
     pr_info("Cleaned up %d conversations\n", count);
 }
-
 
 /* Get statistics for monitoring */
 void context_get_stats(int *total_conversations, int *total_entries,
@@ -548,13 +533,18 @@ ssize_t context_stats_show(struct device *dev, struct device_attribute *attr, ch
                      context_initialized ? "Yes" : "No");
 }
 
-/* Initialize context management system */
+/* Initialize context management system with hash table */
 int context_management_init(void)
 {
     if (context_initialized) {
         pr_warn("context_management_init: Already initialized\n");
         return 0;
     }
+
+    /* Initialize global lock */
+    spin_lock_init(&conversations_lock);
+
+    /* Hash table is already initialized by DEFINE_HASHTABLE */
 
     /* Reset statistics */
     atomic_set(&entries_added, 0);
@@ -567,7 +557,7 @@ int context_management_init(void)
     ratelimit_state.burst = 10;
 
     context_initialized = true;
-    pr_info("Conversation context management initialized\n");
+    pr_info("Conversation context management initialized with hash table\n");
     return 0;
 }
 

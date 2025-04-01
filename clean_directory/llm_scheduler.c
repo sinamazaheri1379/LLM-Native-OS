@@ -5,6 +5,7 @@
 #include <linux/atomic.h>
 #include <linux/random.h>
 #include <linux/slab.h>
+#include <linux/rbtree.h>
 #include "orchestrator_main.h"
 
 /* Constants for scheduler logic */
@@ -14,6 +15,12 @@
 #define DEFAULT_TOKEN_WEIGHT     100
 #define TOKEN_WEIGHT_FACTOR      1000000
 #define METRICS_ADJUST_INTERVAL  10
+
+/* Priority levels for scheduling */
+#define PRIORITY_HIGH      0
+#define PRIORITY_NORMAL    1
+#define PRIORITY_LOW       2
+#define PRIORITY_LEVELS    3
 
 /* Provider model information */
 static const char *openai_default_model = "gpt-4o";
@@ -32,9 +39,85 @@ static const char *gemini_supported_models[] = {
         "gemini-1.5-pro", "gemini-1.0-pro", NULL
 };
 
+/* Priority queue for scheduling */
+struct priority_entry {
+    struct rb_node node;       /* For red-black tree */
+    struct llm_request *req;   /* Request data */
+    int priority;              /* Request priority */
+    ktime_t submit_time;       /* Submission timestamp */
+    int request_id;            /* Unique ID */
+};
+
+struct priority_queue {
+    struct rb_root root;       /* Red-black tree root */
+    int count;                 /* Number of entries */
+    spinlock_t lock;           /* Queue lock */
+};
+
+/* Global priority queues - one per priority level */
+static struct priority_queue priority_queues[PRIORITY_LEVELS];
+
 /* Provider metrics and weight locks */
 static DEFINE_SPINLOCK(metrics_lock);
 static DEFINE_SPINLOCK(weights_lock);
+static atomic_t request_counter = ATOMIC_INIT(0);
+
+/* Initialize priority queue */
+static void priority_queue_init(struct priority_queue *queue)
+{
+    queue->root = RB_ROOT;
+    queue->count = 0;
+    spin_lock_init(&queue->lock);
+}
+
+/* Insert entry into priority queue (ordered by submission time) */
+static void priority_queue_insert(struct priority_queue *queue, struct priority_entry *entry)
+{
+    struct rb_node **new = &queue->root.rb_node, *parent = NULL;
+    unsigned long flags;
+
+    spin_lock_irqsave(&queue->lock, flags);
+
+    /* Find insertion point in tree - sort by submission time */
+    while (*new) {
+        struct priority_entry *this = rb_entry(*new, struct priority_entry, node);
+        parent = *new;
+
+        if (ktime_before(entry->submit_time, this->submit_time))
+            new = &((*new)->rb_left);
+        else
+            new = &((*new)->rb_right);
+    }
+
+    /* Add new node and rebalance tree */
+    rb_link_node(&entry->node, parent, new);
+    rb_insert_color(&entry->node, &queue->root);
+
+    queue->count++;
+
+    spin_unlock_irqrestore(&queue->lock, flags);
+}
+
+/* Get next entry from priority queue (FIFO within priority level) */
+static struct priority_entry *priority_queue_get(struct priority_queue *queue)
+{
+    struct rb_node *first;
+    struct priority_entry *entry = NULL;
+    unsigned long flags;
+
+    spin_lock_irqsave(&queue->lock, flags);
+
+    first = rb_first(&queue->root);
+    if (first) {
+        entry = rb_entry(first, struct priority_entry, node);
+        rb_erase(first, &queue->root);
+        queue->count--;
+    }
+
+    spin_unlock_irqrestore(&queue->lock, flags);
+
+    return entry;
+}
 
 /*
  * Get default model for provider
@@ -95,8 +178,7 @@ bool is_model_supported(int provider, const char *model_name)
 }
 
 /*
- * Initialize scheduler state
- * Handles state validation and proper initialization of all components
+ * Initialize scheduler state with priority queues
  */
 void scheduler_init(struct scheduler_state *state)
 {
@@ -156,12 +238,89 @@ void scheduler_init(struct scheduler_state *state)
     spin_unlock_irqrestore(&metrics_lock, flags);
 
     /* Initialize FIFO queue */
-    spin_lock_init(&state->fifo.lock);
-    state->fifo.head = 0;
-    state->fifo.tail = 0;
-    state->fifo.count = 0;
+    fifo_init(&state->fifo);
 
-    pr_info("LLM scheduler initialized\n");
+    /* Initialize priority queues */
+    for (i = 0; i < PRIORITY_LEVELS; i++) {
+        priority_queue_init(&priority_queues[i]);
+    }
+
+    pr_info("LLM scheduler initialized with priority-based scheduling\n");
+}
+
+/*
+ * Submit a request to the priority queue
+ * Returns 0 on success, negative error code on failure
+ */
+int scheduler_submit_request(struct llm_request *req, int priority)
+{
+    struct priority_entry *entry;
+
+    /* Validate request */
+    if (!req) {
+        pr_err("scheduler_submit_request: Invalid request\n");
+        return -EINVAL;
+    }
+
+    /* Validate priority */
+    if (priority < 0 || priority >= PRIORITY_LEVELS) {
+        priority = PRIORITY_NORMAL; /* Default to normal priority */
+    }
+
+    /* Allocate priority entry */
+    entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry) {
+        pr_err("scheduler_submit_request: Failed to allocate priority entry\n");
+        return -ENOMEM;
+    }
+
+    /* Make a copy of the request */
+    entry->req = kmalloc(sizeof(struct llm_request), GFP_KERNEL);
+    if (!entry->req) {
+        kfree(entry);
+        pr_err("scheduler_submit_request: Failed to allocate request copy\n");
+        return -ENOMEM;
+    }
+
+    /* Initialize entry */
+    memcpy(entry->req, req, sizeof(struct llm_request));
+    entry->priority = priority;
+    entry->submit_time = ktime_get();
+    entry->request_id = atomic_inc_return(&request_counter);
+
+    /* Add to appropriate priority queue */
+    priority_queue_insert(&priority_queues[priority], entry);
+
+    pr_debug("scheduler_submit_request: Request %d submitted with priority %d\n",
+             entry->request_id, priority);
+
+    return 0;
+}
+
+/*
+ * Get the next request from priority queues
+ * Returns the request pointer on success, NULL if no requests
+ */
+struct llm_request *scheduler_get_next_request(void)
+{
+    struct priority_entry *entry = NULL;
+    struct llm_request *req = NULL;
+    int i;
+
+    /* Check each priority queue in order */
+    for (i = 0; i < PRIORITY_LEVELS; i++) {
+        entry = priority_queue_get(&priority_queues[i]);
+        if (entry) {
+            break;
+        }
+    }
+
+    if (entry) {
+        req = entry->req;
+        kfree(entry); /* Free the entry but keep the request */
+    }
+
+    return req;
 }
 
 /*
@@ -541,6 +700,32 @@ static int select_fallback(struct llm_request *req, struct scheduler_state *stat
 }
 
 /*
+ * Handle case where req->provider_override is specified
+ * Returns the requested provider if available, otherwise -1
+ */
+static int handle_provider_override(struct llm_request *req, struct scheduler_state *state)
+{
+    int provider;
+
+    if (!req || !state) {
+        return -1;
+    }
+
+    /* Check if provider is explicitly specified and valid */
+    provider = req->provider_override;
+    if (provider >= 0 && provider < PROVIDER_COUNT) {
+        /* Check if specified provider is available */
+        if (is_provider_available(provider, state)) {
+            return provider;
+        }
+
+        pr_debug("handle_provider_override: Requested provider %d is unavailable\n", provider);
+    }
+
+    return -1; /* No override or provider unavailable */
+}
+
+/*
  * Select provider based on request and scheduler state
  * Main entry point for provider selection
  */
@@ -552,6 +737,13 @@ int select_provider(struct llm_request *req, struct scheduler_state *state)
     if (!req || !state) {
         pr_err("select_provider: Invalid request or state pointer\n");
         return 0;
+    }
+
+    /* Check for provider override */
+    provider = handle_provider_override(req, state);
+    if (provider >= 0) {
+        pr_debug("select_provider: Using provider override %d\n", provider);
+        return provider;
     }
 
     algorithm = req->scheduler_algorithm;
@@ -969,6 +1161,45 @@ void fifo_cleanup(struct fifo_queue *fifo)
     pr_debug("FIFO queue cleaned up\n");
 }
 
+/*
+ * Initialize priority-based scheduling
+ */
+int scheduler_priority_init(void)
+{
+    int i;
+
+    /* Initialize priority queues */
+    for (i = 0; i < PRIORITY_LEVELS; i++) {
+        priority_queue_init(&priority_queues[i]);
+    }
+
+    pr_info("Priority-based scheduling initialized\n");
+    return 0;
+}
+
+/*
+ * Clean up priority-based scheduling
+ */
+void scheduler_priority_cleanup(void)
+{
+    int i;
+
+    /* Clean up priority queues */
+    for (i = 0; i < PRIORITY_LEVELS; i++) {
+        struct priority_entry *entry;
+
+        /* Free all entries */
+        while ((entry = priority_queue_get(&priority_queues[i])) != NULL) {
+            if (entry->req) {
+                kfree(entry->req);
+            }
+            kfree(entry);
+        }
+    }
+
+    pr_info("Priority-based scheduling cleaned up\n");
+}
+
 /* Module exports */
 EXPORT_SYMBOL(scheduler_init);
 EXPORT_SYMBOL(select_provider);
@@ -983,3 +1214,7 @@ EXPORT_SYMBOL(fifo_add_provider);
 EXPORT_SYMBOL(fifo_cleanup);
 EXPORT_SYMBOL(get_default_model);
 EXPORT_SYMBOL(is_model_supported);
+EXPORT_SYMBOL(scheduler_submit_request);
+EXPORT_SYMBOL(scheduler_get_next_request);
+EXPORT_SYMBOL(scheduler_priority_init);
+EXPORT_SYMBOL(scheduler_priority_cleanup);

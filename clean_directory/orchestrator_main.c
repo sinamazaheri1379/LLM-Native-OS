@@ -50,15 +50,22 @@ static int orchestrator_release(struct inode *inode, struct file *file);
 static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
 static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
 
-/* Character device operations */
+/* Update file operations */
 static struct file_operations orchestrator_fops = {
-        .owner = THIS_MODULE,
-        .open = orchestrator_open,
-        .release = orchestrator_release,
-        .read = orchestrator_read,
-        .write = orchestrator_write,
+    .owner = THIS_MODULE,
+    .open = orchestrator_open,
+    .release = orchestrator_release,
+    .read = orchestrator_read,
+    .write = orchestrator_write,
+    .unlocked_ioctl = orchestrator_ioctl, /* New ioctl handler */
 };
 
+/* Define IOCTL commands in orchestrator_main.h */
+#define IOCTL_SET_PREFERRED_PROVIDER _IOW('L', 1, int)
+#define IOCTL_SET_REQUEST_PRIORITY   _IOW('L', 2, int)
+#define IOCTL_GET_REQUEST_STATUS     _IOR('L', 3, int)
+#define IOCTL_GET_PROVIDER_STATS     _IOR('L', 4, struct provider_stat_info)
+/* You'll need to define provider_stat_info structure */
 
 /*
  * Implementation of provider-specific API functions
@@ -791,7 +798,7 @@ static void clear_all_api_keys(void)
     }
 }
 
-/* Main request orchestration function */
+/* Modify orchestrate_request to use the response parameter */
 static int orchestrate_request(struct llm_request *req, struct llm_response *resp)
 {
     int selected_provider, ret = -EINVAL;
@@ -806,8 +813,14 @@ static int orchestrate_request(struct llm_request *req, struct llm_response *res
     memset(resp, 0, sizeof(*resp));
     resp->timestamp = ktime_get();
 
-    /* Select provider based on scheduling algorithm */
-    selected_provider = select_provider(req, &global_scheduler);
+    /* If provider is explicitly specified and valid, use it */
+    if (req->provider_override >= 0 && req->provider_override < PROVIDER_COUNT) {
+        selected_provider = req->provider_override;
+    } else {
+        /* Select provider based on scheduling algorithm */
+        selected_provider = select_provider(req, &global_scheduler);
+    }
+
     if (selected_provider < 0)
         return selected_provider;
 
@@ -840,15 +853,15 @@ static int orchestrate_request(struct llm_request *req, struct llm_response *res
 
         switch (provider) {
             case PROVIDER_OPENAI:
-              	pr_info("Enter OPenAI");
+                pr_debug("orchestrate_request: Using OpenAI provider\n");
                 ret = llm_send_openai(openai_api_key, req, resp);
                 break;
             case PROVIDER_ANTHROPIC:
-              	pr_info("Enter ANthropic");
+                pr_debug("orchestrate_request: Using Anthropic provider\n");
                 ret = llm_send_anthropic(anthropic_api_key, req, resp);
                 break;
             case PROVIDER_GOOGLE_GEMINI:
-              	pr_info("Enter Gemini");
+                pr_debug("orchestrate_request: Using Google Gemini provider\n");
                 ret = llm_send_google_gemini(google_gemini_api_key, req, resp);
                 break;
             default:
@@ -884,52 +897,96 @@ static void maintenance_timer_callback(unsigned long data)
     mod_timer(&maintenance_timer, jiffies + HZ * 60 * 10); /* Run every 10 minutes */
 }
 
-/* Update orchestrator_open function */
+/* Request ID counter */
+static atomic_t request_counter = ATOMIC_INIT(0);
+
+/* Updated orchestrator_open function */
 static int orchestrator_open(struct inode *inode, struct file *file)
 {
+    struct llm_response_wrapper *wrapper;
+
     /* Initialize registry if needed */
     if (atomic_read(&registry_initialized) == 0)
         scheduler_registry_init();
+
+    /* Allocate and initialize response wrapper for this file */
+    wrapper = kmalloc(sizeof(*wrapper), GFP_KERNEL);
+    if (!wrapper)
+        return -ENOMEM;
+
+    memset(&wrapper->resp, 0, sizeof(wrapper->resp));
+    wrapper->request_id = atomic_inc_return(&request_counter);
+    atomic_set(&wrapper->completed, 0);
+    wrapper->priority = PRIORITY_NORMAL; /* Default priority */
+    wrapper->preferred_provider = -1;    /* No preference by default */
+
+    /* Store wrapper in file's private data */
+    file->private_data = wrapper;
 
     /* Store scheduler state in registry */
     set_scheduler_state(&global_scheduler);
     return 0;
 }
 
-/* Update orchestrator_release function */
+/* Updated orchestrator_release function */
 static int orchestrator_release(struct inode *inode, struct file *file)
 {
-    /* Remove from registry */
+    struct llm_response_wrapper *wrapper = file->private_data;
+
+    /* Free response wrapper */
+    if (wrapper) {
+        kfree(wrapper);
+        file->private_data = NULL;
+    }
+
+    /* Remove scheduler state from registry */
     remove_scheduler_state();
     return 0;
 }
 
+/* Updated orchestrator_write function */
 static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
 {
     struct llm_request* req;
+    struct llm_response_wrapper *wrapper = file->private_data;
     int ret;
+
+    if (!wrapper)
+        return -EINVAL;
 
     if (count != sizeof(struct llm_request)){
         return -EINVAL;
     }
-	req = kmalloc(sizeof(struct llm_request), GFP_KERNEL);
+
+    req = kmalloc(sizeof(struct llm_request), GFP_KERNEL);
     if (!req){
         return -ENOMEM;
     }
+
     if (copy_from_user(req, buf, sizeof(*req))) {
         kfree(req);
         return -EFAULT;
     }
 
-    /* Comprehensive input validation */
+    /* Set request priority from wrapper (can be changed via ioctl) */
+    req->priority = wrapper->priority;
+
+    /* Set preferred provider from wrapper if not explicitly set in request */
+    if (req->provider_override < 0 && wrapper->preferred_provider >= 0) {
+        req->provider_override = wrapper->preferred_provider;
+    }
+
+    /* Validation code */
     if (req->conversation_id <= 0) {
         pr_err("orchestrator_write: Invalid conversation_id: %d\n", req->conversation_id);
+        kfree(req);
         return -EINVAL;
     }
 
     /* Validate prompt - ensure it's not empty and is null-terminated */
     if (req->prompt[0] == '\0') {
         pr_err("orchestrator_write: Empty prompt\n");
+        kfree(req);
         return -EINVAL;
     }
     req->prompt[MAX_PROMPT_LENGTH - 1] = '\0';
@@ -962,102 +1019,158 @@ static ssize_t orchestrator_write(struct file *file, const char __user *buf, siz
     /* Validate scheduler algorithm */
     if (req->scheduler_algorithm != -1 && (req->scheduler_algorithm < 0 || req->scheduler_algorithm > SCHEDULER_MAX_ALGORITHM)) {
         pr_warn("orchestrator_write: Invalid scheduler algorithm: %d, using default\n",
-        req->scheduler_algorithm);
+                req->scheduler_algorithm);
         req->scheduler_algorithm = -1; /* Use default from state */
     }
 
-    /* Validate priority */
-    if (req->priority < 0) {
-        req->priority = 0;
-    } else if (req->priority > 100) {
-        req->priority = 100;
-    }
+    /* Reset completion flag */
+    atomic_set(&wrapper->completed, 0);
 
+    /* Process request using file-specific response buffer */
     mutex_lock(&orchestrator_mutex);
-    ret = orchestrate_request(req, &global_response);
+    ret = orchestrate_request(req, &wrapper->resp);
     mutex_unlock(&orchestrator_mutex);
+
+    /* Mark as completed regardless of result */
+    atomic_set(&wrapper->completed, 1);
+
     kfree(req);
     return ret < 0 ? ret : count;
 }
+
+/* Updated orchestrator_read function with thread safety */
 static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
+    struct llm_response_wrapper *wrapper = file->private_data;
     ssize_t ret;
     char *extracted_content = NULL;
 
-    mutex_lock(&orchestrator_mutex);
+    if (!wrapper)
+        return -EINVAL;
 
-    if (global_response.content_length == 0) {
-        mutex_unlock(&orchestrator_mutex);
+    /* No mutex needed here since each file has its own response buffer */
+
+    if (wrapper->resp.content_length == 0) {
         return 0;
+    }
+
+    /* Wait for completion if necessary */
+    if (!atomic_read(&wrapper->completed)) {
+        pr_debug("orchestrator_read: Request not completed yet\n");
+        return -EAGAIN;
     }
 
     /* Allocate buffer for the extracted content */
     extracted_content = kmalloc(MAX_RESPONSE_LENGTH, GFP_KERNEL);
     if (!extracted_content) {
         pr_err("orchestrator_read: Failed to allocate content buffer\n");
-        mutex_unlock(&orchestrator_mutex);
         return -ENOMEM;
     }
 
     /* Choose the appropriate extractor based on the provider used */
-    switch (global_response.provider_used) {
+    switch (wrapper->resp.provider_used) {
         case PROVIDER_OPENAI:
-          pr_debug("Providing OpenAIS\n");
-            ret = extract_openai_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+            pr_debug("Providing OpenAI response\n");
+            ret = extract_openai_content(wrapper->resp.content, extracted_content, MAX_RESPONSE_LENGTH);
             break;
 
         case PROVIDER_ANTHROPIC:
-          pr_info("Providing anthrotropic\n");
-            ret = extract_anthropic_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+            pr_debug("Providing Anthropic response\n");
+            ret = extract_anthropic_content(wrapper->resp.content, extracted_content, MAX_RESPONSE_LENGTH);
             break;
 
         case PROVIDER_GOOGLE_GEMINI:
-          pr_info("Providing Google Mini\n");
-            ret = extract_gemini_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+            pr_debug("Providing Google Gemini response\n");
+            ret = extract_gemini_content(wrapper->resp.content, extracted_content, MAX_RESPONSE_LENGTH);
             break;
 
         default:
             pr_warn("orchestrator_read: Unknown provider %d, using generic extractor\n",
-                   global_response.provider_used);
-            ret = extract_response_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+                   wrapper->resp.provider_used);
+            ret = extract_response_content(wrapper->resp.content, extracted_content, MAX_RESPONSE_LENGTH);
             break;
     }
 
     if (ret <= 0) {
         /* If specialized extraction fails, fall back to generic extractor */
         pr_debug("orchestrator_read: Provider-specific extractor failed, trying generic extractor\n");
-        ret = extract_response_content(global_response.content, extracted_content, MAX_RESPONSE_LENGTH);
+        ret = extract_response_content(wrapper->resp.content, extracted_content, MAX_RESPONSE_LENGTH);
     }
 
     if (ret > 0) {
         /* Return the extracted content */
         if (count < ret) {
             kfree(extracted_content);
-            mutex_unlock(&orchestrator_mutex);
             return -EINVAL;
         }
 
         if (copy_to_user(buf, extracted_content, ret)) {
             kfree(extracted_content);
-            mutex_unlock(&orchestrator_mutex);
             return -EFAULT;
         }
     } else {
         /* Fallback: return the full response if extraction failed */
         pr_warn("orchestrator_read: Content extraction failed, returning full response\n");
-        if (copy_to_user(buf, global_response.content, global_response.content_length)) {
+        if (copy_to_user(buf, wrapper->resp.content, wrapper->resp.content_length)) {
             kfree(extracted_content);
-            mutex_unlock(&orchestrator_mutex);
             return -EFAULT;
         }
-        ret = global_response.content_length;
+        ret = wrapper->resp.content_length;
     }
 
     kfree(extracted_content);
-    global_response.content_length = 0;
-    mutex_unlock(&orchestrator_mutex);
+    wrapper->resp.content_length = 0; /* Reset for next read */
     return ret;
 }
+
+/* New ioctl function to support additional controls */
+static long orchestrator_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct llm_response_wrapper *wrapper = file->private_data;
+    int value;
+
+    if (!wrapper)
+        return -EINVAL;
+
+    switch (cmd) {
+        case IOCTL_SET_PREFERRED_PROVIDER:
+            if (copy_from_user(&value, (int __user *)arg, sizeof(int)))
+                return -EFAULT;
+
+            if (value < -1 || value >= PROVIDER_COUNT)
+                return -EINVAL;
+
+            wrapper->preferred_provider = value;
+            pr_debug("orchestrator_ioctl: Set preferred provider to %d\n", value);
+            return 0;
+
+        case IOCTL_SET_REQUEST_PRIORITY:
+            if (copy_from_user(&value, (int __user *)arg, sizeof(int)))
+                return -EFAULT;
+
+            if (value < 0 || value >= PRIORITY_LEVELS)
+                return -EINVAL;
+
+            wrapper->priority = value;
+            pr_debug("orchestrator_ioctl: Set priority to %d\n", value);
+            return 0;
+
+        case IOCTL_GET_REQUEST_STATUS:
+            value = atomic_read(&wrapper->completed);
+            if (copy_to_user((int __user *)arg, &value, sizeof(int)))
+                return -EFAULT;
+
+            return 0;
+
+        case IOCTL_GET_PROVIDER_STATS:
+            /* Implement provider stats retrieval */
+            return -ENOSYS; /* Not implemented yet */
+
+        default:
+            return -ENOTTY; /* Inappropriate ioctl for device */
+    }
+}
+
 static ssize_t scheduler_algorithm_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
     int algorithm = atomic_read(&global_scheduler.current_algorithm);
