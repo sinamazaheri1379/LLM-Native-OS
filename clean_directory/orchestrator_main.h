@@ -36,6 +36,19 @@
 #define PROVIDER_ANTHROPIC 1
 #define PROVIDER_GOOGLE_GEMINI 2
 
+/* Constants for scheduler logic */
+#define WEIGHT_TOTAL_PERCENT     100
+#define MIN_PROVIDER_WEIGHT      5
+#define RATE_LIMIT_PENALTY       20
+#define DEFAULT_TOKEN_WEIGHT     100
+#define TOKEN_WEIGHT_FACTOR      1000000
+#define METRICS_ADJUST_INTERVAL  10
+
+/* Priority levels for scheduling */
+#define PRIORITY_HIGH      0
+#define PRIORITY_NORMAL    1
+#define PRIORITY_LOW       2
+#define PRIORITY_LEVELS    3
 /* Scheduler algorithms */
 #define SCHEDULER_ROUND_ROBIN 0
 #define SCHEDULER_WEIGHTED 1
@@ -91,23 +104,6 @@ struct llm_response {
     int tokens_used;
     unsigned long rate_limit_reset_ms;
 };
-
-struct context_entry {
-    char role[MAX_ROLE_NAME];
-    char content[MAX_CONTENT_LENGTH];
-    ktime_t timestamp;
-    struct list_head list;
-};
-
-struct conversation_context {
-    int conversation_id;
-    int entry_count;
-    ktime_t last_updated;
-    struct list_head entries;
-    spinlock_t lock;
-    struct list_head list;
-};
-
 struct provider_metrics {
     atomic_t current_status;
     atomic_t total_requests;
@@ -149,11 +145,55 @@ struct llm_response_wrapper {
     int preferred_provider;     /* Preferred provider for this file */
 };
 
-/* Add to struct file_operations */
-struct llm_response_wrapper {
-    struct llm_response resp;
-    /* Add other per-file data if needed */
+/* For batch entry processing */
+struct context_entry_batch {
+    char role[MAX_ROLE_NAME];
+    char content[MAX_CONTENT_LENGTH];
 };
+
+/* Enhanced context_entry structure - cache friendly alignment */
+struct context_entry {
+    char role[MAX_ROLE_NAME];
+    char content[MAX_CONTENT_LENGTH];
+    ktime_t timestamp;           /* When entry was added */
+    struct list_head list;       /* For standard linked list */
+    struct rb_node time_node;    /* For time-based indexing */
+} __attribute__((aligned(64)));  /* Align to cache line for better performance */
+
+/* Enhanced conversation context structure */
+struct conversation_context {
+    int conversation_id;
+    int entry_count;
+    ktime_t last_updated;
+    ktime_t last_json_generation; /* When JSON was last generated */
+    atomic_t ref_count;          /* Reference count for safe memory management */
+    size_t total_memory;         /* Total memory used by this conversation */
+    struct list_head entries;    /* List of entries in order of addition */
+    struct rb_root entries_by_time; /* Red-black tree for time-based lookups */
+    spinlock_t lock;             /* Per-conversation lock */
+    struct hlist_node hnode;     /* For hash table */
+    struct list_head cleanup_node; /* For cleanup lists */
+    char *json_cache;            /* Cache for JSON serialization */
+};
+struct provider_stat_info {
+    int provider_id;
+    int total_requests;
+    int successful_requests;
+    int failed_requests;
+    int timeouts;
+    int rate_limited;
+    long long total_latency_ms;
+    unsigned long min_latency_ms;
+    unsigned long max_latency_ms;
+    int total_tokens;
+    int status;  // 0 = rate limited, 1 = available
+};
+/* Function prototypes for new operations */
+int context_add_entries_batch(int conversation_id,
+                             const struct context_entry_batch *entries,
+                             int count);
+void context_get_cache_stats(int *hits, int *misses, int *hit_ratio_percent);
+void context_set_memory_pressure(int level);
 bool is_ip_address_valid(const char *ip);
 struct llm_provider_config *get_provider_config(int provider_id);
 /* FIFO queue functions */

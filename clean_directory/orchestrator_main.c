@@ -49,7 +49,7 @@ static int orchestrator_open(struct inode *inode, struct file *file);
 static int orchestrator_release(struct inode *inode, struct file *file);
 static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
 static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
-
+static long orchestrator_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 /* Update file operations */
 static struct file_operations orchestrator_fops = {
     .owner = THIS_MODULE,

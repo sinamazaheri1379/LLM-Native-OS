@@ -8,19 +8,6 @@
 #include <linux/rbtree.h>
 #include "orchestrator_main.h"
 
-/* Constants for scheduler logic */
-#define WEIGHT_TOTAL_PERCENT     100
-#define MIN_PROVIDER_WEIGHT      5
-#define RATE_LIMIT_PENALTY       20
-#define DEFAULT_TOKEN_WEIGHT     100
-#define TOKEN_WEIGHT_FACTOR      1000000
-#define METRICS_ADJUST_INTERVAL  10
-
-/* Priority levels for scheduling */
-#define PRIORITY_HIGH      0
-#define PRIORITY_NORMAL    1
-#define PRIORITY_LOW       2
-#define PRIORITY_LEVELS    3
 
 /* Provider model information */
 static const char *openai_default_model = "gpt-4o";
