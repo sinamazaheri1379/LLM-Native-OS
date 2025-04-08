@@ -11,21 +11,29 @@
 #include <linux/ratelimit.h>
 #include <linux/hashtable.h>
 #include <linux/rbtree.h>
-#include <linux/shrinker.h>
 #include <linux/mm.h>
 #include <linux/atomic.h>
 #include <linux/rcupdate.h>
 #include <linux/limits.h>
 #include <linux/jiffies.h>
+#include <linux/timer.h>
+#include <linux/version.h>
 #include "orchestrator_main.h"
+/* Replace the shrinker struct with a timer */
+// static struct shrinker context_shrinker;  /* REMOVE THIS */
 
+
+/* Add these constants for timer configuration */
+#define MEMORY_CHECK_INTERVAL (5 * 60 * HZ)  /* Check every 5 minutes */
+#define MEMORY_CHECK_FIRST_INTERVAL (30 * HZ) /* First check after 30 seconds */
 /* Constants for safe buffer management */
 #define MAX_JSON_CACHE_SIZE (1024 * 1024)  /* 1MB max cache size */
 #define INITIAL_ENTRY_BUFFER_SIZE 1024     /* Initial buffer for formatting entry JSON */
 #define MAX_ENTRY_BUFFER_SIZE (32 * 1024)  /* Maximum buffer size for entry formatting */
 #define CONTEXT_VERSION_INITIAL 1          /* Initial version for cache validity */
 #define MAX_ENTRIES_TO_PROCESS 32          /* Max entries to process in a batch */
-
+#define RECENT_CACHE_SIZE 16
+#define HASH_TABLE_BITS 10  /* Fixed size of 1024 buckets (2^10) */
 /* Statistics for monitoring */
 static atomic_t entries_added = ATOMIC_INIT(0);
 static atomic_t conversations_created = ATOMIC_INIT(0);
@@ -34,29 +42,17 @@ static atomic_t json_generated = ATOMIC_INIT(0);
 static atomic_t cache_hits = ATOMIC_INIT(0);
 static atomic_t cache_misses = ATOMIC_INIT(0);
 static atomic_t alloc_failures = ATOMIC_INIT(0);
-
+static struct timer_list memory_management_timer;
 /* Rate limiting for debug logs */
 static DEFINE_RATELIMIT_STATE(ratelimit_state, 5 * HZ, 10);
 
 /* Determine hash table size based on available memory */
-#define HASH_TABLE_BITS 10  /* Fixed size of 1024 buckets (2^10) */
-
 /* Hash table for conversation contexts - dynamically sized based on memory */
 DEFINE_HASHTABLE(conversation_table, HASH_TABLE_BITS);
 DEFINE_SPINLOCK(conversations_lock); /* Global lock for hash table operations */
 static bool context_initialized = false;
-
 /* Recent conversations cache - improves performance for frequent accesses */
-#define RECENT_CACHE_SIZE 16
-static struct {
-    int conversation_id;
-    struct conversation_context *ctx;
-    atomic_t usage_count;
-} recent_cache[RECENT_CACHE_SIZE];
 static DEFINE_SPINLOCK(cache_lock);
-
-/* Memory pressure handling */
-static struct shrinker context_shrinker;
 static atomic_t memory_pressure_level = ATOMIC_INIT(0);
 
 /* Function declarations for static helpers */
@@ -70,15 +66,6 @@ static void context_put(struct conversation_context *ctx);
 static void insert_entry_time_index(struct conversation_context *ctx,
                                    struct context_entry *entry);
 static struct context_entry *get_oldest_entry(struct conversation_context *ctx);
-static unsigned long context_shrink_count(struct shrinker *shrink,
-                                         struct shrink_control *sc);
-static unsigned long context_shrink_scan(struct shrinker *shrink,
-                                        struct shrink_control *sc);
-static void register_context_shrinker(void);
-static int format_json_entry(struct llm_json_buffer *json_buf,
-                            struct llm_json_buffer *cache_buf,
-                            const struct context_entry *entry,
-                            char *entry_json, size_t buffer_size);
 static void conversation_free_callback(struct rcu_head *head);
 
 /* Structure to hold entry data for JSON generation */
@@ -86,7 +73,75 @@ struct entry_data {
     char role[MAX_ROLE_NAME];
     char content[MAX_CONTENT_LENGTH];
 };
+static struct {
+    int conversation_id;
+    struct conversation_context *ctx;
+    atomic_t usage_count;
+} recent_cache[RECENT_CACHE_SIZE];
 
+/* Add this cleanup function */
+static void cleanup_memory_management_timer(void)
+{
+    /* Delete the timer if it's active */
+    del_timer_sync(&memory_management_timer);
+    pr_info("Memory management timer cleaned up\n");
+}
+
+
+
+/* Timer callback function to replace the shrinker */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
+static void memory_management_timer_fn(struct timer_list *t)
+#else
+static void memory_management_timer_fn(unsigned long data)
+#endif
+{
+    int level = atomic_read(&memory_pressure_level);
+    unsigned long threshold_ms;
+    int freed;
+
+    /* Same adaptive threshold logic from context_shrink_scan */
+    switch (level) {
+        case 0: /* No pressure */
+            threshold_ms = 24 * 60 * 60 * 1000; /* 24 hours */
+        break;
+        case 1: /* Moderate */
+            threshold_ms = 6 * 60 * 60 * 1000;  /* 6 hours */
+        break;
+        case 2: /* High */
+            threshold_ms = 1 * 60 * 60 * 1000;  /* 1 hour */
+        break;
+        default: /* Critical */
+            threshold_ms = 10 * 60 * 1000;      /* 10 minutes */
+        break;
+    }
+
+    /* Prune old conversations - reusing existing function */
+    freed = context_prune_old_conversations(threshold_ms);
+
+    if (freed > 0) {
+        pr_info("Memory management timer: Pruned %d old conversations\n", freed);
+    }
+
+    /* Reschedule the timer */
+    mod_timer(&memory_management_timer, jiffies + MEMORY_CHECK_INTERVAL);
+}
+
+/* Replace register_context_shrinker with this function */
+static void setup_memory_management_timer(void)
+{
+    /* Initialize and start the timer */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
+    timer_setup(&memory_management_timer, memory_management_timer_fn, 0);
+#else
+    setup_timer(&memory_management_timer, memory_management_timer_fn, 0);
+#endif
+
+    /* Start the timer */
+    mod_timer(&memory_management_timer, jiffies + MEMORY_CHECK_FIRST_INTERVAL);
+
+    pr_info("Memory management timer initialized\n");
+}
 /* Custom hash function for conversation IDs - helps reduce hash collisions */
 static inline u32 conversation_hash(int conversation_id)
 {
@@ -631,50 +686,6 @@ int context_add_entries_batch(int conversation_id,
     return added > 0 ? added : ret;
 }
 
-/* Helper function to safely format an entry as JSON */
-static int format_json_entry(struct llm_json_buffer *json_buf,
-                            struct llm_json_buffer *cache_buf,
-                            const struct context_entry *entry,
-                            char *entry_json, size_t buffer_size)
-{
-    int ret;
-
-    /* Format entry JSON with buffer size check */
-    ret = snprintf(entry_json, buffer_size, "{\"role\":\"%s\",\"content\":\"", entry->role);
-    if (ret < 0) {
-        return -EIO; /* More specific error for formatting failure */
-    }
-
-    if (ret >= buffer_size) {
-        return -ENOSPC; /* Buffer too small */
-    }
-
-    /* Add to both output and cache buffers */
-    ret = append_json_string(json_buf, entry_json);
-    if (ret)
-        return ret;
-
-    ret = append_json_string(cache_buf, entry_json);
-    if (ret)
-        return ret;
-
-    ret = append_json_value(json_buf, entry->content);
-    if (ret)
-        return ret;
-
-    ret = append_json_value(cache_buf, entry->content);
-    if (ret)
-        return ret;
-
-    ret = append_json_string(json_buf, "\"}");
-    if (ret)
-        return ret;
-
-    ret = append_json_string(cache_buf, "\"}");
-
-    return ret;
-}
-
 /* Improved JSON buffer with cached serialization - using two-phase approach to reduce lock time */
 int context_get_conversation(int conversation_id, struct llm_json_buffer *json_buf)
 {
@@ -1013,52 +1024,6 @@ int context_clear_conversation(int conversation_id)
     return 0;
 }
 
-/* Memory pressure callback */
-static unsigned long context_shrink_count(struct shrinker *shrink,
-                                         struct shrink_control *sc)
-{
-    /* Report an estimate of freeable memory */
-    return atomic_read(&entries_added) - atomic_read(&entries_pruned);
-}
-
-static unsigned long context_shrink_scan(struct shrinker *shrink,
-                                        struct shrink_control *sc)
-{
-    unsigned long freed = 0;
-    int level = atomic_read(&memory_pressure_level);
-    unsigned long threshold_ms;
-
-    /* Adapt pruning threshold based on memory pressure level */
-    switch (level) {
-        case 0: /* No pressure */
-            threshold_ms = 24 * 60 * 60 * 1000; /* 24 hours */
-            break;
-        case 1: /* Moderate */
-            threshold_ms = 6 * 60 * 60 * 1000;  /* 6 hours */
-            break;
-        case 2: /* High */
-            threshold_ms = 1 * 60 * 60 * 1000;  /* 1 hour */
-            break;
-        default: /* Critical */
-            threshold_ms = 10 * 60 * 1000;      /* 10 minutes */
-            break;
-    }
-
-    /* Prune old conversations based on adaptive threshold */
-    freed = context_prune_old_conversations(threshold_ms);
-
-    /* Convert to pages */
-    return freed * sizeof(struct context_entry) / PAGE_SIZE;
-}
-
-/* Register shrinker callbacks */
-static void register_context_shrinker(void)
-{
-    context_shrinker.count_objects = context_shrink_count;
-    context_shrinker.scan_objects = context_shrink_scan;
-    context_shrinker.seeks = DEFAULT_SEEKS;
-    register_shrinker(&context_shrinker);
-}
 
 /* Use RCU safe version for conversation deletion */
 static void conversation_free_callback(struct rcu_head *head)
@@ -1074,7 +1039,6 @@ int context_prune_old_conversations(unsigned long age_threshold_ms)
     unsigned long flags;
     ktime_t cutoff_time;
     int pruned = 0;
-    struct hlist_node *tmp;
     int i;
     LIST_HEAD(cleanup_contexts);
 
@@ -1181,7 +1145,7 @@ int context_management_init(void)
     init_recent_cache();
 
     /* Register memory pressure handler */
-    register_context_shrinker();
+    setup_memory_management_timer();
 
     /* Mark as initialized */
     context_initialized = true;
@@ -1235,7 +1199,7 @@ void context_cleanup_all(void)
     synchronize_rcu();
 
     /* Unregister shrinker */
-    unregister_shrinker(&context_shrinker);
+    cleanup_memory_management_timer();
 
     context_initialized = false;
 

@@ -8,6 +8,7 @@
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
 #include <linux/device.h>
+#include <linux/shrinker.h>
 /* Constants for buffer sizes, error codes */
 #define DRIVER_VERSION "2.0"
 #define MAX_PROMPT_LENGTH 4096
@@ -174,6 +175,8 @@ struct conversation_context {
     struct hlist_node hnode;     /* For hash table */
     struct list_head cleanup_node; /* For cleanup lists */
     char *json_cache;            /* Cache for JSON serialization */
+    u32 cache_version;        /* Version for cache validity */
+    struct rcu_head rcu;      /* RCU callback structure */
 };
 struct provider_stat_info {
     int provider_id;
@@ -218,6 +221,7 @@ int context_set_memory_limits(size_t max_total, size_t max_per_conversation,
 void context_cleanup_memory_tracking(void);
 struct context_entry *context_allocate_entry(int conversation_id);
 void context_free_entry(int conversation_id, struct context_entry *entry);
+void context_get_alloc_stats(int *failures, int *entries_added_count, int *entries_pruned_count);
 void display_content(char* content);
 /* JSON utility functions */
 int json_buffer_init(struct llm_json_buffer *buf, size_t size);
@@ -303,4 +307,7 @@ int extract_gemini_content(const char *json, char *output, size_t output_size);
 /* Add to orchestrator_main.h */
 int tls_send(struct socket *sock, void *data, size_t len);
 int tls_recv(struct socket *sock, void *data, size_t len, int flags);
+int scheduler_submit_request(struct llm_request *req, int priority);
+struct llm_request *scheduler_get_next_request(void);
+void scheduler_priority_cleanup(void);
 #endif /* ORCHESTRATOR_MAIN_H */

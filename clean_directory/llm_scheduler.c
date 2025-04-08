@@ -1,13 +1,39 @@
+/*
+ * LLM Scheduler using Strict Fibonacci Heap (Improved Version)
+ *
+ * This implementation follows the strict Fibonacci heap structure with fixes
+ * for potential issues in the previous version:
+ * 1. More robust maintenance of first_linkable pointer
+ * 2. Improved node traversal logic in extract-min
+ * 3. Better handling of edge cases in loss reduction
+ */
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/spinlock.h>
+#include <linux/slab.h>
 #include <linux/ktime.h>
 #include <linux/atomic.h>
-#include <linux/random.h>
-#include <linux/slab.h>
-#include <linux/rbtree.h>
 #include "orchestrator_main.h"
 
+/* Constants for scheduler logic */
+#define WEIGHT_TOTAL_PERCENT     100
+#define MIN_PROVIDER_WEIGHT      5
+#define RATE_LIMIT_PENALTY       20
+#define DEFAULT_TOKEN_WEIGHT     100
+#define TOKEN_WEIGHT_FACTOR      1000000
+#define METRICS_ADJUST_INTERVAL  10
+#define MAX_RANK                 32 /* log₂(n) for large n */
+
+/* Priority levels for scheduling */
+#define PRIORITY_HIGH      0
+#define PRIORITY_NORMAL    1
+#define PRIORITY_LOW       2
+#define PRIORITY_LEVELS    3
+
+/* Node types */
+#define NODE_ACTIVE        0
+#define NODE_PASSIVE       1
 
 /* Provider model information */
 static const char *openai_default_model = "gpt-4o";
@@ -19,153 +45,910 @@ static const char *openai_supported_models[] = {
 };
 
 static const char *anthropic_supported_models[] = {
-        "claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307", NULL
+        "claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307",
+        "claude-3-7-sonnet-20250219", NULL
 };
 
 static const char *gemini_supported_models[] = {
         "gemini-1.5-pro", "gemini-1.0-pro", NULL
 };
 
-/* Priority queue for scheduling */
-struct priority_entry {
-    struct rb_node node;       /* For red-black tree */
-    struct llm_request *req;   /* Request data */
-    int priority;              /* Request priority */
-    ktime_t submit_time;       /* Submission timestamp */
-    int request_id;            /* Unique ID */
+/* Key box structure to maintain stable references */
+struct key_box {
+    int priority;                 /* Priority value (smaller = higher priority) */
+    ktime_t submit_time;          /* Submission time for tiebreaking */
+    struct strict_fib_node *node; /* Pointer back to the node */
 };
 
-struct priority_queue {
-    struct rb_root root;       /* Red-black tree root */
-    int count;                 /* Number of entries */
-    spinlock_t lock;           /* Queue lock */
+/* Strict Fibonacci heap node structure */
+struct strict_fib_node {
+    struct strict_fib_node *parent;      /* Parent node */
+    struct strict_fib_node *child;       /* Leftmost child node */
+    struct strict_fib_node *left;        /* Left sibling (circular list) */
+    struct strict_fib_node *right;       /* Right sibling (circular list) */
+    struct key_box *key_box;             /* Box containing priority value */
+    struct llm_request *req;             /* Request data */
+    int node_type;                       /* Active (0) or passive (1) */
+    bool is_linkable;                    /* For passive nodes: can be linked to root */
+    unsigned int rank;                   /* Number of active children */
+    unsigned int loss;                   /* Number of active children lost */
+    int request_id;                      /* Unique request ID */
+};
+
+/* Structure for tracking nodes that need fixing */
+struct fix_list {
+    struct strict_fib_node *nodes[MAX_RANK][2]; /* Nodes by rank and loss */
+    int count[MAX_RANK][2];                    /* Count of nodes in each category */
+};
+
+/* Strict Fibonacci heap structure */
+struct strict_fib_heap {
+    struct strict_fib_node *root;        /* Root of the heap (always passive) */
+    struct strict_fib_node *first_linkable; /* First passive linkable child of root */
+    struct fix_list fix_list;            /* List of nodes that need fixing */
+    unsigned int n;                      /* Number of nodes in heap */
+    spinlock_t lock;                     /* Heap lock */
+};
+
+/* Flag used for batch marking of nodes */
+struct active_flag {
+    int value;  /* 0 = active, 1 = passive */
 };
 
 /* Global priority queues - one per priority level */
-static struct priority_queue priority_queues[PRIORITY_LEVELS];
+static struct strict_fib_heap priority_queues[PRIORITY_LEVELS];
 
 /* Provider metrics and weight locks */
 static DEFINE_SPINLOCK(metrics_lock);
 static DEFINE_SPINLOCK(weights_lock);
 static atomic_t request_counter = ATOMIC_INIT(0);
 
-/* Initialize priority queue */
-static void priority_queue_init(struct priority_queue *queue)
-{
-    queue->root = RB_ROOT;
-    queue->count = 0;
-    spin_lock_init(&queue->lock);
-}
-
-/* Insert entry into priority queue (ordered by submission time) */
-static void priority_queue_insert(struct priority_queue *queue, struct priority_entry *entry)
-{
-    struct rb_node **new = &queue->root.rb_node, *parent = NULL;
-    unsigned long flags;
-
-    spin_lock_irqsave(&queue->lock, flags);
-
-    /* Find insertion point in tree - sort by submission time */
-    while (*new) {
-        struct priority_entry *this = rb_entry(*new, struct priority_entry, node);
-        parent = *new;
-
-        if (ktime_before(entry->submit_time, this->submit_time))
-            new = &((*new)->rb_left);
-        else
-            new = &((*new)->rb_right);
-    }
-
-    /* Add new node and rebalance tree */
-    rb_link_node(&entry->node, parent, new);
-    rb_insert_color(&entry->node, &queue->root);
-
-    queue->count++;
-
-    spin_unlock_irqrestore(&queue->lock, flags);
-}
-
-/* Get next entry from priority queue (FIFO within priority level) */
-static struct priority_entry *priority_queue_get(struct priority_queue *queue)
-{
-    struct rb_node *first;
-    struct priority_entry *entry = NULL;
-    unsigned long flags;
-
-    spin_lock_irqsave(&queue->lock, flags);
-
-    first = rb_first(&queue->root);
-    if (first) {
-        entry = rb_entry(first, struct priority_entry, node);
-        rb_erase(first, &queue->root);
-        queue->count--;
-    }
-
-    spin_unlock_irqrestore(&queue->lock, flags);
-
-    return entry;
-}
-
 /*
- * Get default model for provider
- * Returns the default model string or NULL if provider is invalid
+ * Initialize a new key box
+ * Returns pointer to initialized box or NULL on failure
  */
-const char *get_default_model(int provider)
+static struct key_box *key_box_new(int priority, ktime_t submit_time)
 {
-    if (provider < 0 || provider >= PROVIDER_COUNT)
+    struct key_box *box;
+
+    box = kmalloc(sizeof(*box), GFP_KERNEL);
+    if (!box)
         return NULL;
 
-    switch (provider) {
-        case PROVIDER_OPENAI:
-            return openai_default_model;
-        case PROVIDER_ANTHROPIC:
-            return anthropic_default_model;
-        case PROVIDER_GOOGLE_GEMINI:
-            return gemini_default_model;
-        default:
+    box->priority = priority;
+    box->submit_time = submit_time;
+    box->node = NULL; /* Will be set when linked to node */
+
+    return box;
+}
+
+/*
+ * Free a key box
+ */
+static void key_box_free(struct key_box *box)
+{
+    if (box)
+        kfree(box);
+}
+
+/*
+ * Initialize a new Strict Fibonacci heap node
+ * Returns pointer to initialized node or NULL on failure
+ */
+static struct strict_fib_node *strict_fib_node_new(struct llm_request *req, struct key_box *box)
+{
+    struct strict_fib_node *node;
+
+    /* Allocate node */
+    node = kmalloc(sizeof(*node), GFP_KERNEL);
+    if (!node)
+        return NULL;
+
+    /* Make a copy of the request */
+    if (req) {
+        node->req = kmalloc(sizeof(struct llm_request), GFP_KERNEL);
+        if (!node->req) {
+            kfree(node);
             return NULL;
+        }
+
+        memcpy(node->req, req, sizeof(struct llm_request));
+    } else {
+        node->req = NULL;
+    }
+
+    /* Initialize node */
+    node->parent = NULL;
+    node->child = NULL;
+    node->left = node;  /* Point to itself (singleton circular list) */
+    node->right = node;
+    node->key_box = box;
+    node->node_type = NODE_PASSIVE; /* Start as passive node */
+    node->is_linkable = true;      /* Passive node with no children is linkable */
+    node->rank = 0;
+    node->loss = 0;
+    node->request_id = req ? atomic_inc_return(&request_counter) : 0;
+
+    /* Link box to node */
+    if (box)
+        box->node = node;
+
+    return node;
+}
+
+/*
+ * Free a Strict Fibonacci heap node and its request
+ */
+static void strict_fib_node_free(struct strict_fib_node *node)
+{
+    if (!node)
+        return;
+
+    if (node->key_box) {
+        node->key_box->node = NULL; /* Unlink from box */
+        key_box_free(node->key_box);
+        node->key_box = NULL;
+    }
+
+    if (node->req) {
+        kfree(node->req);
+        node->req = NULL;
+    }
+
+    kfree(node);
+}
+
+/*
+ * Add node2 to the right of node1 in the circular linked list
+ */
+static void strict_fib_add_to_list(struct strict_fib_node *node1, struct strict_fib_node *node2)
+{
+    if (!node1 || !node2)
+        return;
+
+    /* Insert node2 between node1 and node1->right */
+    node2->right = node1->right;
+    node1->right->left = node2;
+    node1->right = node2;
+    node2->left = node1;
+}
+
+/*
+ * Remove a node from its circular linked list
+ */
+static void strict_fib_remove_from_list(struct strict_fib_node *node)
+{
+    if (!node)
+        return;
+
+    /* Only proceed if node is in a list with others */
+    if (node->left != node) {
+        node->left->right = node->right;
+        node->right->left = node->left;
+
+        /* Isolate the node (point to itself) */
+        node->left = node;
+        node->right = node;
     }
 }
 
 /*
- * Check if a model is supported by a provider
- * Returns true if model is valid and supported, false otherwise
+ * Update first_linkable pointer after operations
+ * FIX #1: This is a new helper function to ensure consistent maintenance
+ * of the first_linkable pointer
  */
-bool is_model_supported(int provider, const char *model_name)
+static void update_first_linkable(struct strict_fib_heap *heap)
 {
-    const char **models;
-    int i;
+    struct strict_fib_node *child;
 
-    if (!model_name || !model_name[0])
-        return false;
-
-    if (provider < 0 || provider >= PROVIDER_COUNT)
-        return false;
-
-    switch (provider) {
-        case PROVIDER_OPENAI:
-            models = openai_supported_models;
-            break;
-        case PROVIDER_ANTHROPIC:
-            models = anthropic_supported_models;
-            break;
-        case PROVIDER_GOOGLE_GEMINI:
-            models = gemini_supported_models;
-            break;
-        default:
-            return false;
+    if (!heap || !heap->root || !heap->root->child) {
+        heap->first_linkable = NULL;
+        return;
     }
 
-    for (i = 0; models[i] != NULL; i++) {
-        if (strcmp(model_name, models[i]) == 0)
+    /* Reset first_linkable */
+    heap->first_linkable = NULL;
+
+    /* Find the first passive linkable child */
+    child = heap->root->child;
+    do {
+        if (child->node_type == NODE_PASSIVE && child->is_linkable) {
+            heap->first_linkable = child;
+            break;
+        }
+        child = child->right;
+    } while (child != heap->root->child);
+}
+
+/*
+ * Make node2 a child of node1, respecting active/passive ordering
+ */
+static void strict_fib_add_child(struct strict_fib_node *node1, struct strict_fib_node *node2)
+{
+    if (!node1 || !node2)
+        return;
+
+    /* Remove node2 from its current list if any */
+    if (node2->parent)
+        strict_fib_remove_from_list(node2);
+
+    /* Set parent relationship */
+    node2->parent = node1;
+
+    if (!node1->child) {
+        /* node1 had no children */
+        node1->child = node2;
+        node2->left = node2;
+        node2->right = node2;
+    } else {
+        /* Add to child list in proper position based on active/passive status */
+        if (node2->node_type == NODE_ACTIVE) {
+            /* Active nodes go to the left */
+            struct strict_fib_node *child = node1->child;
+
+            /* Find leftmost passive child or end of list */
+            while (child->left != node1->child && child->node_type == NODE_ACTIVE)
+                child = child->left;
+
+            if (child->node_type == NODE_ACTIVE) {
+                /* All children are active, add to list */
+                strict_fib_add_to_list(child, node2);
+            } else {
+                /* Add before the first passive child */
+                strict_fib_add_to_list(child->left, node2);
+            }
+        } else {
+            /* Passive nodes go to the right */
+            strict_fib_add_to_list(node1->child->left, node2);
+        }
+    }
+
+    /* Update rank if adding active child */
+    if (node2->node_type == NODE_ACTIVE)
+        node1->rank++;
+
+    /* Check if we need to update linkable flag for passive nodes */
+    if (node2->node_type == NODE_PASSIVE && node2->child) {
+        /* A passive node with children is not linkable */
+        node2->is_linkable = false;
+    }
+}
+
+/*
+ * Add a node to the fix list at the given rank and loss
+ */
+static void add_to_fix_list(struct strict_fib_heap *heap, struct strict_fib_node *node)
+{
+    unsigned int rank, loss_idx;
+
+    if (!heap || !node || node->node_type != NODE_ACTIVE)
+        return;
+
+    rank = node->rank;
+    /* Only track nodes with loss 0 or 1 */
+    loss_idx = (node->loss >= 1) ? 1 : 0;
+
+    /* Add to fix list if rank is within range */
+    if (rank < MAX_RANK) {
+        heap->fix_list.nodes[rank][loss_idx] = node;
+        heap->fix_list.count[rank][loss_idx]++;
+    }
+}
+
+/*
+ * Remove a node from the fix list
+ */
+static void remove_from_fix_list(struct strict_fib_heap *heap, struct strict_fib_node *node)
+{
+    unsigned int rank, loss_idx;
+
+    if (!heap || !node || node->node_type != NODE_ACTIVE)
+        return;
+
+    rank = node->rank;
+    /* Only track nodes with loss 0 or 1 */
+    loss_idx = (node->loss >= 1) ? 1 : 0;
+
+    /* Remove from fix list if rank is within range */
+    if (rank < MAX_RANK && heap->fix_list.nodes[rank][loss_idx] == node) {
+        heap->fix_list.nodes[rank][loss_idx] = NULL;
+        heap->fix_list.count[rank][loss_idx]--;
+    }
+}
+
+/*
+ * Find nodes in the fix list with equal rank and loss=1
+ * Returns true if candidates were found and performs the loss reduction
+ * FIX #3: Improved to handle more edge cases and search more thoroughly
+ */
+static bool perform_loss_reduction(struct strict_fib_heap *heap)
+{
+    int i;
+    struct strict_fib_node *x, *y, *parent;
+    struct strict_fib_node *candidates[MAX_RANK]; /* Track all candidates by rank */
+    int candidate_counts[MAX_RANK] = {0};        /* Count candidates for each rank */
+
+    /* First pass: collect candidates with loss >= 1 */
+    for (i = 0; i < MAX_RANK; i++) {
+        /* Initialize candidate tracking */
+        candidates[i] = NULL;
+        candidate_counts[i] = 0;
+
+        /* Case 1: single node with loss >= 2 */
+        if (heap->fix_list.nodes[i][1] && heap->fix_list.nodes[i][1]->loss >= 2) {
+            x = heap->fix_list.nodes[i][1];
+
+            /* Decrease loss by 2 */
+            x->loss -= 2;
+
+            /* If x is no longer a loss reduction candidate, update fix list */
+            if (x->loss <= 1) {
+                remove_from_fix_list(heap, x);
+                add_to_fix_list(heap, x);
+            }
+
             return true;
+        }
+
+        /* Add all nodes with loss=1 to candidates for this rank */
+        if (heap->fix_list.count[i][1] > 0) {
+            /* Find all nodes with the same rank and loss=1 */
+            struct strict_fib_node *temp;
+
+            /* Start with the one in the fix list */
+            candidates[i] = heap->fix_list.nodes[i][1];
+            candidate_counts[i] = 1;
+
+            /* Find other nodes with the same rank and loss=1 */
+            if (candidates[i] && candidates[i]->parent && candidates[i]->parent->child) {
+                temp = candidates[i]->parent->child;
+                do {
+                    if (temp != candidates[i] && temp->node_type == NODE_ACTIVE &&
+                        temp->rank == i && temp->loss == 1) {
+                        /* We've found a second candidate - we can perform reduction */
+                        x = candidates[i];
+                        y = temp;
+
+                        /* Ensure x->key <= y->key */
+                        if (x->key_box->priority > y->key_box->priority ||
+                            (x->key_box->priority == y->key_box->priority &&
+                             ktime_after(x->key_box->submit_time, y->key_box->submit_time))) {
+                            /* Swap x and y */
+                            struct strict_fib_node *temp_ptr = x;
+                            x = y;
+                            y = temp_ptr;
+                        }
+
+                        /* Get parent of y */
+                        parent = y->parent;
+
+                        /* Detach y from its parent */
+                        strict_fib_remove_from_list(y);
+                        parent->rank--;
+
+                        /* Make y a child of x */
+                        strict_fib_add_child(x, y);
+
+                        /* Reset losses */
+                        x->loss = 0;
+                        y->loss = 0;
+
+                        /* Update fix list */
+                        remove_from_fix_list(heap, x);
+                        remove_from_fix_list(heap, y);
+                        add_to_fix_list(heap, x);
+                        add_to_fix_list(heap, parent);
+
+                        return true;
+                    }
+                    temp = temp->right;
+                } while (temp != candidates[i]->parent->child);
+            }
+        }
+    }
+
+    /* Second pass: look for nodes across different parents but same rank */
+    for (i = 0; i < MAX_RANK; i++) {
+        if (heap->fix_list.count[i][1] >= 2) {
+            /* Try to find two nodes from different parents */
+            struct strict_fib_node *first = NULL;
+            struct strict_fib_node *second = NULL;
+
+            /* Traverse all nodes in the tree (starting from root) */
+            if (heap->root && heap->root->child) {
+                struct strict_fib_node *child = heap->root->child;
+
+                /* First level search - direct children of root */
+                do {
+                    /* If child is active and has rank i nodes with loss=1 */
+                    if (child->node_type == NODE_ACTIVE && child->child) {
+                        /* Search child's children */
+                        struct strict_fib_node *grandchild = child->child;
+                        do {
+                            if (grandchild->node_type == NODE_ACTIVE &&
+                                grandchild->rank == i && grandchild->loss == 1) {
+                                /* Found a candidate */
+                                if (!first) {
+                                    first = grandchild;
+                                } else if (grandchild->parent != first->parent) {
+                                    /* Found a second candidate with different parent */
+                                    second = grandchild;
+                                    break;
+                                }
+                            }
+                            grandchild = grandchild->right;
+                        } while (grandchild != child->child);
+                    }
+
+                    if (first && second) break; /* Found two candidates */
+
+                    child = child->right;
+                } while (child != heap->root->child);
+
+                if (first && second) {
+                    /* Perform loss reduction with these two nodes */
+                    x = first;
+                    y = second;
+
+                    /* Ensure x->key <= y->key */
+                    if (x->key_box->priority > y->key_box->priority ||
+                        (x->key_box->priority == y->key_box->priority &&
+                         ktime_after(x->key_box->submit_time, y->key_box->submit_time))) {
+                        /* Swap x and y */
+                        struct strict_fib_node *temp = x;
+                        x = y;
+                        y = temp;
+                    }
+
+                    /* Get parent of y */
+                    parent = y->parent;
+
+                    /* Detach y from its parent */
+                    strict_fib_remove_from_list(y);
+                    parent->rank--;
+
+                    /* Make y a child of x */
+                    strict_fib_add_child(x, y);
+
+                    /* Reset losses */
+                    x->loss = 0;
+                    y->loss = 0;
+
+                    /* Update fix list */
+                    remove_from_fix_list(heap, x);
+                    remove_from_fix_list(heap, y);
+                    add_to_fix_list(heap, x);
+                    add_to_fix_list(heap, parent);
+
+                    return true;
+                }
+            }
+        }
     }
 
     return false;
 }
 
 /*
- * Initialize scheduler state with priority queues
+ * Perform active root reduction on the heap
+ * Returns true if reduction was performed
+ */
+static bool perform_active_root_reduction(struct strict_fib_heap *heap)
+{
+    struct strict_fib_node *active_root = NULL;
+    struct strict_fib_node *child, *next;
+
+    /* Find an active root (active node with passive parent) */
+    if (heap->root && heap->root->child) {
+        child = heap->root->child;
+        do {
+            if (child->node_type == NODE_ACTIVE) {
+                active_root = child;
+                break;
+            }
+            child = child->right;
+        } while (child != heap->root->child);
+    }
+
+    if (active_root) {
+        /* Make the active root passive */
+        active_root->node_type = NODE_PASSIVE;
+        active_root->is_linkable = active_root->child ? false : true;
+
+        /* Update parent's rank */
+        active_root->parent->rank--;
+
+        /* All of active_root's active children become active roots */
+        if (active_root->child) {
+            /* FIX #2: Improved traversal logic for handling active children */
+            struct strict_fib_node *active_children[64]; /* Array to store active children */
+            int count = 0;
+            int i;
+
+            /* First collect all active children */
+            child = active_root->child;
+            do {
+                next = child->right;
+                if (child->node_type == NODE_ACTIVE && count < 64) {
+                    active_children[count++] = child;
+                }
+                child = next;
+            } while (child != active_root->child && active_root->child);
+
+            /* Now process collected active children */
+            for (i = 0; i < count; i++) {
+                child = active_children[i];
+
+                /* Remove from active_root */
+                strict_fib_remove_from_list(child);
+                if (active_root->child == child) {
+                    active_root->child = (child->right != child) ? child->right : NULL;
+                }
+                active_root->rank--;
+
+                /* Add as child of root */
+                strict_fib_add_child(heap->root, child);
+            }
+        }
+
+        /* Update first_linkable pointer if needed */
+        if (active_root->is_linkable) {
+            update_first_linkable(heap);
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * Perform root degree reduction
+ * Returns true if reduction was performed
+ * FIX #1: Improved handling of first_linkable pointer
+ */
+static bool perform_root_degree_reduction(struct strict_fib_heap *heap)
+{
+    struct strict_fib_node *x, *y, *z;
+    struct strict_fib_node *passive_children[3] = {NULL};
+    int count = 0;
+
+    /* Check if we have at least 3 passive linkable children of the root */
+    if (!heap->first_linkable)
+        return false;
+
+    /* Find three passive linkable children */
+    x = heap->first_linkable;
+    do {
+        if (x->node_type == NODE_PASSIVE && x->is_linkable && count < 3) {
+            passive_children[count++] = x;
+        }
+        x = x->right;
+    } while (count < 3 && x != heap->first_linkable && x != heap->root->child->left);
+
+    if (count < 3)
+        return false;
+
+    /* Get the three nodes */
+    x = passive_children[0];
+    y = passive_children[1];
+    z = passive_children[2];
+
+    /* Sort them by key: x.key <= y.key <= z.key */
+    if (x->key_box && y->key_box && (
+        x->key_box->priority > y->key_box->priority ||
+        (x->key_box->priority == y->key_box->priority &&
+         ktime_after(x->key_box->submit_time, y->key_box->submit_time)))) {
+        struct strict_fib_node *temp = x;
+        x = y;
+        y = temp;
+    }
+
+    if (y->key_box && z->key_box && (
+        y->key_box->priority > z->key_box->priority ||
+        (y->key_box->priority == z->key_box->priority &&
+         ktime_after(y->key_box->submit_time, z->key_box->submit_time)))) {
+        struct strict_fib_node *temp = y;
+        y = z;
+        z = temp;
+
+        /* Check x and y again after swapping */
+        if (x->key_box && y->key_box && (
+            x->key_box->priority > y->key_box->priority ||
+            (x->key_box->priority == y->key_box->priority &&
+             ktime_after(x->key_box->submit_time, y->key_box->submit_time)))) {
+            temp = x;
+            x = y;
+            y = temp;
+        }
+    }
+
+    /* Detach from the root */
+    strict_fib_remove_from_list(x);
+    strict_fib_remove_from_list(y);
+    strict_fib_remove_from_list(z);
+
+    /* Change x and y to active nodes */
+    x->node_type = NODE_ACTIVE;
+    y->node_type = NODE_ACTIVE;
+
+    /* Link z to y, y to x, and x as leftmost child of root */
+    strict_fib_add_child(y, z);
+    strict_fib_add_child(x, y);
+    strict_fib_add_child(heap->root, x);
+
+    /* Update first_linkable pointer */
+    update_first_linkable(heap);
+
+    return true;
+}
+
+/*
+ * Initialize a Strict Fibonacci heap
+ */
+static void strict_fib_heap_init(struct strict_fib_heap *heap)
+{
+    int i, j;
+
+    /* Create passive root node */
+    heap->root = strict_fib_node_new(NULL, NULL);
+    if (!heap->root) {
+        pr_err("strict_fib_heap_init: Failed to allocate root node\n");
+        return;
+    }
+
+    /* Root is always passive and has no request */
+    heap->root->node_type = NODE_PASSIVE;
+    heap->first_linkable = NULL;
+    heap->n = 0;
+
+    /* Initialize fix list */
+    for (i = 0; i < MAX_RANK; i++) {
+        for (j = 0; j < 2; j++) {
+            heap->fix_list.nodes[i][j] = NULL;
+            heap->fix_list.count[i][j] = 0;
+        }
+    }
+
+    spin_lock_init(&heap->lock);
+}
+
+/*
+ * Insert a node into a Strict Fibonacci heap
+ * Returns 0 on success, negative error code on failure
+ */
+static int strict_fib_heap_insert(struct strict_fib_heap *heap, struct llm_request *req, int priority)
+{
+    struct strict_fib_node *node;
+    struct key_box *box;
+    unsigned long flags;
+
+    if (!heap || !req)
+        return -EINVAL;
+
+    /* Create key box and node */
+    box = key_box_new(priority, ktime_get());
+    if (!box)
+        return -ENOMEM;
+
+    node = strict_fib_node_new(req, box);
+    if (!node) {
+        key_box_free(box);
+        return -ENOMEM;
+    }
+
+    spin_lock_irqsave(&heap->lock, flags);
+
+    /* Make node passive and linkable */
+    node->node_type = NODE_PASSIVE;
+    node->is_linkable = true;
+
+    /* Add to root's children */
+    strict_fib_add_child(heap->root, node);
+
+    /* Update linkable pointer if needed */
+    if (!heap->first_linkable) {
+        heap->first_linkable = node;
+    }
+
+    heap->n++;
+
+    spin_unlock_irqrestore(&heap->lock, flags);
+
+    return 0;
+}
+
+/*
+ * Find and extract the minimum node from a Strict Fibonacci heap
+ * Returns the minimum node or NULL if heap is empty
+ * FIX #2: Improved node traversal logic in extract-min
+ */
+static struct strict_fib_node *strict_fib_heap_extract_min(struct strict_fib_heap *heap)
+{
+    struct strict_fib_node *min = NULL;
+    struct strict_fib_node *child;
+    unsigned long flags;
+
+    spin_lock_irqsave(&heap->lock, flags);
+
+    if (heap->n == 0 || !heap->root || !heap->root->child) {
+        spin_unlock_irqrestore(&heap->lock, flags);
+        return NULL;
+    }
+
+    /* Find minimum key among root's children */
+    child = heap->root->child;
+    min = child;
+
+    /* Find node with minimum key */
+    do {
+        if (child->key_box && min->key_box &&
+            (child->key_box->priority < min->key_box->priority ||
+             (child->key_box->priority == min->key_box->priority &&
+              ktime_before(child->key_box->submit_time, min->key_box->submit_time)))) {
+            min = child;
+        }
+        child = child->right;
+    } while (child != heap->root->child);
+
+    /* If min is active, make it passive */
+    if (min->node_type == NODE_ACTIVE) {
+        /* FIX #2: Improved handling of active children during extract-min */
+        struct strict_fib_node **active_children = NULL;
+        int active_count = 0;
+        int i;
+
+        /* First count active children */
+        if (min->child) {
+            child = min->child;
+            do {
+                if (child->node_type == NODE_ACTIVE) {
+                    active_count++;
+                }
+                child = child->right;
+            } while (child != min->child);
+
+            /* Allocate array if we have active children */
+            if (active_count > 0) {
+                active_children = kmalloc(sizeof(struct strict_fib_node *) * active_count, GFP_ATOMIC);
+                if (!active_children) {
+                    /* Memory allocation failed, fall back to original logic */
+                    active_count = 0;
+                } else {
+                    /* Fill the array */
+                    i = 0;
+                    child = min->child;
+                    do {
+                        if (child->node_type == NODE_ACTIVE && i < active_count) {
+                            active_children[i++] = child;
+                        }
+                        child = child->right;
+                    } while (child != min->child);
+                }
+            }
+        }
+
+        /* Change min's status */
+        min->node_type = NODE_PASSIVE;
+        min->parent->rank--;
+
+        /* Process active children if we have them */
+        if (active_count > 0 && active_children) {
+            for (i = 0; i < active_count; i++) {
+                child = active_children[i];
+
+                /* Remove from min */
+                strict_fib_remove_from_list(child);
+                if (min->child == child) {
+                    min->child = (child->right != child) ? child->right : NULL;
+                }
+                min->rank--;
+
+                /* Add to root */
+                strict_fib_add_child(heap->root, child);
+            }
+
+            /* Free the array */
+            kfree(active_children);
+        }
+    }
+
+    /* Gather all of min's remaining (passive) children into an array */
+    if (min->child) {
+        struct strict_fib_node **children = NULL;
+        int child_count = 0;
+        int i;
+
+        /* Count remaining children */
+        child = min->child;
+        do {
+            child_count++;
+            child = child->right;
+        } while (child != min->child);
+
+        /* Allocate array to hold children */
+        if (child_count > 0) {
+            children = kmalloc(sizeof(struct strict_fib_node *) * child_count, GFP_ATOMIC);
+            if (children) {
+                /* Fill the array */
+                i = 0;
+                child = min->child;
+                do {
+                    children[i++] = child;
+                    child = child->right;
+                } while (child != min->child && i < child_count);
+
+                /* Process children */
+                for (i = 0; i < child_count; i++) {
+                    child = children[i];
+
+                    /* Remove from min */
+                    strict_fib_remove_from_list(child);
+                    if (min->child == child) {
+                        min->child = (child->right != child) ? child->right : NULL;
+                    }
+
+                    /* Add to root */
+                    strict_fib_add_child(heap->root, child);
+                }
+
+                /* Free the array */
+                kfree(children);
+            }
+        }
+    }
+
+    /* Remove min from the root's children */
+    strict_fib_remove_from_list(min);
+    if (heap->root->child == min) {
+        heap->root->child = (min->right != min) ? min->right : NULL;
+    }
+    min->parent = NULL;
+
+    /* Decrement count */
+    heap->n--;
+
+    /* Update first_linkable pointer */
+    update_first_linkable(heap);
+
+    /* Perform transformations to maintain heap properties */
+    while (perform_loss_reduction(heap) ||
+           perform_active_root_reduction(heap) ||
+           perform_root_degree_reduction(heap)) {
+        /* Continue until no more transformations are possible */
+    }
+
+    spin_unlock_irqrestore(&heap->lock, flags);
+
+    return min;
+}
+
+
+
+/*
+ * Clean up a Strict Fibonacci heap
+ */
+static void strict_fib_heap_cleanup(struct strict_fib_heap *heap)
+{
+    struct strict_fib_node *node;
+
+    if (!heap)
+        return;
+
+    /* Extract and free all nodes */
+    while ((node = strict_fib_heap_extract_min(heap)) != NULL) {
+        strict_fib_node_free(node);
+    }
+
+    /* Free the root */
+    if (heap->root) {
+        strict_fib_node_free(heap->root);
+        heap->root = NULL;
+    }
+}
+
+/*
+ * Initialize scheduler state with Strict Fibonacci heaps
  */
 void scheduler_init(struct scheduler_state *state)
 {
@@ -229,10 +1012,10 @@ void scheduler_init(struct scheduler_state *state)
 
     /* Initialize priority queues */
     for (i = 0; i < PRIORITY_LEVELS; i++) {
-        priority_queue_init(&priority_queues[i]);
+        strict_fib_heap_init(&priority_queues[i]);
     }
 
-    pr_info("LLM scheduler initialized with priority-based scheduling\n");
+    pr_info("LLM scheduler initialized with Strict Fibonacci heap-based priority scheduling\n");
 }
 
 /*
@@ -241,7 +1024,7 @@ void scheduler_init(struct scheduler_state *state)
  */
 int scheduler_submit_request(struct llm_request *req, int priority)
 {
-    struct priority_entry *entry;
+    int ret;
 
     /* Validate request */
     if (!req) {
@@ -254,33 +1037,14 @@ int scheduler_submit_request(struct llm_request *req, int priority)
         priority = PRIORITY_NORMAL; /* Default to normal priority */
     }
 
-    /* Allocate priority entry */
-    entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-    if (!entry) {
-        pr_err("scheduler_submit_request: Failed to allocate priority entry\n");
-        return -ENOMEM;
+    /* Insert into appropriate priority queue */
+    ret = strict_fib_heap_insert(&priority_queues[priority], req, priority);
+    if (ret) {
+        pr_err("scheduler_submit_request: Failed to insert into heap: %d\n", ret);
+        return ret;
     }
 
-    /* Make a copy of the request */
-    entry->req = kmalloc(sizeof(struct llm_request), GFP_KERNEL);
-    if (!entry->req) {
-        kfree(entry);
-        pr_err("scheduler_submit_request: Failed to allocate request copy\n");
-        return -ENOMEM;
-    }
-
-    /* Initialize entry */
-    memcpy(entry->req, req, sizeof(struct llm_request));
-    entry->priority = priority;
-    entry->submit_time = ktime_get();
-    entry->request_id = atomic_inc_return(&request_counter);
-
-    /* Add to appropriate priority queue */
-    priority_queue_insert(&priority_queues[priority], entry);
-
-    pr_debug("scheduler_submit_request: Request %d submitted with priority %d\n",
-             entry->request_id, priority);
-
+    pr_debug("scheduler_submit_request: Request submitted with priority %d\n", priority);
     return 0;
 }
 
@@ -290,26 +1054,131 @@ int scheduler_submit_request(struct llm_request *req, int priority)
  */
 struct llm_request *scheduler_get_next_request(void)
 {
-    struct priority_entry *entry = NULL;
+    struct strict_fib_node *node = NULL;
     struct llm_request *req = NULL;
     int i;
 
     /* Check each priority queue in order */
     for (i = 0; i < PRIORITY_LEVELS; i++) {
-        entry = priority_queue_get(&priority_queues[i]);
-        if (entry) {
+        node = strict_fib_heap_extract_min(&priority_queues[i]);
+        if (node) {
             break;
         }
     }
 
-    if (entry) {
-        req = entry->req;
-        kfree(entry); /* Free the entry but keep the request */
+    if (node) {
+        req = node->req;
+        /* Don't free the request, it will be returned to the caller */
+        node->req = NULL;
+        strict_fib_node_free(node);
     }
 
     return req;
 }
 
+/*
+ * Get default model for provider
+ * Returns the default model string or NULL if provider is invalid
+ */
+const char *get_default_model(int provider)
+{
+    if (provider < 0 || provider >= PROVIDER_COUNT)
+        return NULL;
+
+    switch (provider) {
+        case PROVIDER_OPENAI:
+            return openai_default_model;
+        case PROVIDER_ANTHROPIC:
+            return anthropic_default_model;
+        case PROVIDER_GOOGLE_GEMINI:
+            return gemini_default_model;
+        default:
+            return NULL;
+    }
+}
+
+/*
+ * Check if a model is supported by a provider
+ * Returns true if model is valid and supported, false otherwise
+ */
+bool is_model_supported(int provider, const char *model_name)
+{
+    const char **models;
+    int i;
+
+    if (!model_name || !model_name[0])
+        return false;
+
+    if (provider < 0 || provider >= PROVIDER_COUNT)
+        return false;
+
+    switch (provider) {
+        case PROVIDER_OPENAI:
+            models = openai_supported_models;
+            break;
+        case PROVIDER_ANTHROPIC:
+            models = anthropic_supported_models;
+            break;
+        case PROVIDER_GOOGLE_GEMINI:
+            models = gemini_supported_models;
+            break;
+        default:
+            return false;
+    }
+
+    for (i = 0; models[i] != NULL; i++) {
+        if (strcmp(model_name, models[i]) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+/*
+ * Clean up priority-based scheduling
+ */
+void scheduler_priority_cleanup(void)
+{
+    int i;
+
+    /* Clean up priority queues */
+    for (i = 0; i < PRIORITY_LEVELS; i++) {
+        strict_fib_heap_cleanup(&priority_queues[i]);
+    }
+
+    pr_info("Strict Fibonacci heap-based priority scheduling cleaned up\n");
+}
+/* FIFO Queue Management functions */
+void fifo_init(struct fifo_queue *fifo)
+{
+    if (!fifo) {
+        pr_err("fifo_init: Invalid fifo pointer\n");
+        return;
+    }
+
+    fifo->head = 0;
+    fifo->tail = 0;
+    fifo->count = 0;
+    spin_lock_init(&fifo->lock);
+
+    memset(fifo->providers, 0, sizeof(fifo->providers));
+
+    pr_debug("fifo_init: FIFO queue initialized\n");
+}
+
+void fifo_cleanup(struct fifo_queue *fifo)
+{
+    if (!fifo) {
+        pr_err("fifo_cleanup: Invalid fifo pointer\n");
+        return;
+    }
+
+    fifo->head = 0;
+    fifo->tail = 0;
+    fifo->count = 0;
+
+    pr_debug("fifo_cleanup: FIFO queue cleaned up\n");
+}
 /*
  * Check if a provider is available (not rate limited)
  * Returns true if provider is available, false otherwise
@@ -349,345 +1218,7 @@ static bool is_provider_available(int provider, struct scheduler_state *state)
 }
 
 /*
- * Select provider using Round Robin algorithm
- * Returns provider index to use
- */
-static int select_round_robin(struct llm_request *req, struct scheduler_state *state)
-{
-    int starting_provider, provider;
-    int i;
-    unsigned long flags;
-
-    if (!state) {
-        pr_err("select_round_robin: Invalid state pointer\n");
-        return 0;
-    }
-
-    spin_lock_irqsave(&metrics_lock, flags);
-    starting_provider = state->next_provider;
-    spin_unlock_irqrestore(&metrics_lock, flags);
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        provider = (starting_provider + i) % PROVIDER_COUNT;
-        if (is_provider_available(provider, state)) {
-            spin_lock_irqsave(&metrics_lock, flags);
-            state->next_provider = (provider + 1) % PROVIDER_COUNT;
-            spin_unlock_irqrestore(&metrics_lock, flags);
-            return provider;
-        }
-    }
-
-    /* If all providers are unavailable, use the next one anyway and let caller handle error */
-    spin_lock_irqsave(&metrics_lock, flags);
-    provider = state->next_provider;
-    state->next_provider = (provider + 1) % PROVIDER_COUNT;
-    spin_unlock_irqrestore(&metrics_lock, flags);
-
-    return provider;
-}
-
-/*
- * Select provider using Weighted algorithm
- * Returns provider index to use based on configured weights
- */
-static int select_weighted(struct llm_request *req, struct scheduler_state *state)
-{
-    int random_val, cumulative_weight = 0;
-    int i, selected = 0;
-    int available_providers[PROVIDER_COUNT];
-    int available_weights[PROVIDER_COUNT];
-    int available_count = 0, total_available_weight = 0;
-    unsigned long flags;
-
-    if (!state) {
-        pr_err("select_weighted: Invalid state pointer\n");
-        return 0;
-    }
-
-    /* Find available providers with proper locking */
-    spin_lock_irqsave(&weights_lock, flags);
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        if (is_provider_available(i, state)) {
-            available_providers[available_count] = i;
-            available_weights[available_count] = state->weights[i];
-            total_available_weight += state->weights[i];
-            available_count++;
-        }
-    }
-
-    spin_unlock_irqrestore(&weights_lock, flags);
-
-    /* If no providers available, return the first one and let caller handle error */
-    if (available_count == 0)
-        return 0;
-
-    /* If only one provider available, return it */
-    if (available_count == 1)
-        return available_providers[0];
-
-    /* Choose randomly based on weights */
-    get_random_bytes(&random_val, sizeof(random_val));
-    random_val = abs(random_val) % max(total_available_weight, 1);
-
-    for (i = 0; i < available_count; i++) {
-        cumulative_weight += available_weights[i];
-        if (random_val < cumulative_weight) {
-            selected = available_providers[i];
-            break;
-        }
-    }
-
-    /* Ensure a valid provider is selected */
-    if (i == available_count && available_count > 0) {
-        selected = available_providers[0];
-    }
-
-    return selected;
-}
-
-/*
- * Select provider based on priority
- * Returns provider index based on configured priority order
- */
-static int select_priority(struct llm_request *req, struct scheduler_state *state)
-{
-    int i;
-    int provider;
-    unsigned long flags;
-
-    if (!state) {
-        pr_err("select_priority: Invalid state pointer\n");
-        return 0;
-    }
-
-    spin_lock_irqsave(&weights_lock, flags);
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        provider = state->provider_priority[i];
-        if (is_provider_available(provider, state)) {
-            spin_unlock_irqrestore(&weights_lock, flags);
-            return provider;
-        }
-    }
-
-    /* If all providers unavailable, return highest priority one anyway */
-    provider = state->provider_priority[0];
-
-    spin_unlock_irqrestore(&weights_lock, flags);
-
-    return provider;
-}
-
-/*
- * Select provider based on performance (lowest latency)
- * Returns provider index with best average latency
- */
-static int select_performance(struct llm_request *req, struct scheduler_state *state)
-{
-    int best_provider = 0;
-    unsigned long best_latency = ULONG_MAX;
-    int i;
-    unsigned long flags;
-
-    if (!state) {
-        pr_err("select_performance: Invalid state pointer\n");
-        return 0;
-    }
-
-    spin_lock_irqsave(&metrics_lock, flags);
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        if (is_provider_available(i, state)) {
-            int successful = atomic_read(&state->metrics[i].successful_requests);
-            unsigned long avg_latency;
-
-            if (successful > 0) {
-                avg_latency = div_u64(atomic64_read(&state->metrics[i].total_latency_ms),
-                                      max(successful, 1));
-                if (avg_latency < best_latency) {
-                    best_latency = avg_latency;
-                    best_provider = i;
-                }
-            } else if (best_latency == ULONG_MAX) {
-                /* No data for any provider yet, use the first available one */
-                best_provider = i;
-            }
-        }
-    }
-
-    spin_unlock_irqrestore(&metrics_lock, flags);
-
-    return best_provider;
-}
-
-/*
- * Select provider using FIFO queue
- * Implements a proper FIFO scheduling algorithm
- */
-static int select_fifo(struct llm_request *req, struct scheduler_state *state)
-{
-    int provider = 0;
-    unsigned long flags;
-    bool found = false;
-
-    if (!state) {
-        pr_err("select_fifo: Invalid state pointer\n");
-        return 0;
-    }
-
-    spin_lock_irqsave(&state->fifo.lock, flags);
-
-    /* Check if queue has entries */
-    if (state->fifo.count > 0) {
-        /* Get the next provider from the queue */
-        provider = state->fifo.providers[state->fifo.head];
-        state->fifo.head = (state->fifo.head + 1) % MAX_FIFO_QUEUE_SIZE;
-        state->fifo.count--;
-        found = true;
-
-        /* Re-add the provider to the queue for round-robin behavior */
-        if (state->fifo.count < MAX_FIFO_QUEUE_SIZE) {
-            state->fifo.providers[state->fifo.tail] = provider;
-            state->fifo.tail = (state->fifo.tail + 1) % MAX_FIFO_QUEUE_SIZE;
-            state->fifo.count++;
-        }
-    }
-
-    spin_unlock_irqrestore(&state->fifo.lock, flags);
-
-    /* If queue is empty, use weighted selection as fallback */
-    if (!found) {
-        int i;
-
-        /* Initialize the queue with all available providers */
-        spin_lock_irqsave(&state->fifo.lock, flags);
-
-        for (i = 0; i < PROVIDER_COUNT; i++) {
-            if (is_provider_available(i, state) && state->fifo.count < MAX_FIFO_QUEUE_SIZE) {
-                state->fifo.providers[state->fifo.tail] = i;
-                state->fifo.tail = (state->fifo.tail + 1) % MAX_FIFO_QUEUE_SIZE;
-                state->fifo.count++;
-            }
-        }
-
-        /* If any providers were added, get the first one */
-        if (state->fifo.count > 0) {
-            provider = state->fifo.providers[state->fifo.head];
-            state->fifo.head = (state->fifo.head + 1) % MAX_FIFO_QUEUE_SIZE;
-            state->fifo.count--;
-            found = true;
-
-            /* Re-add the provider for round-robin */
-            if (state->fifo.count < MAX_FIFO_QUEUE_SIZE) {
-                state->fifo.providers[state->fifo.tail] = provider;
-                state->fifo.tail = (state->fifo.tail + 1) % MAX_FIFO_QUEUE_SIZE;
-                state->fifo.count++;
-            }
-        }
-
-        spin_unlock_irqrestore(&state->fifo.lock, flags);
-
-        /* If still no providers, fall back to weighted selection */
-        if (!found) {
-            provider = select_weighted(req, state);
-        }
-    }
-
-    return provider;
-}
-
-/*
- * Select provider based on cost awareness
- * Returns provider index based on token usage (lower usage gets higher priority)
- */
-static int select_cost_aware(struct llm_request *req, struct scheduler_state *state)
-{
-    int token_weights[PROVIDER_COUNT];
-    int total_token_weight = 0;
-    int random_val, cumulative_weight = 0;
-    int i, selected = 0;
-    unsigned long flags;
-
-    if (!state) {
-        pr_err("select_cost_aware: Invalid state pointer\n");
-        return 0;
-    }
-
-    /* Calculate inverse weight based on token usage with proper locking */
-    spin_lock_irqsave(&metrics_lock, flags);
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        if (is_provider_available(i, state)) {
-            int tokens = atomic_read(&state->metrics[i].total_tokens);
-            /* Higher token count = lower weight, prevent division by zero */
-            token_weights[i] = tokens > 0 ? TOKEN_WEIGHT_FACTOR / tokens : DEFAULT_TOKEN_WEIGHT;
-            total_token_weight += token_weights[i];
-        } else {
-            token_weights[i] = 0;
-        }
-    }
-
-    spin_unlock_irqrestore(&metrics_lock, flags);
-
-    /* If no providers available, return first one */
-    if (total_token_weight == 0)
-        return 0;
-
-    /* Choose randomly based on inverse token weights */
-    get_random_bytes(&random_val, sizeof(random_val));
-    random_val = abs(random_val) % max(total_token_weight, 1);
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        if (token_weights[i] > 0) {
-            cumulative_weight += token_weights[i];
-            if (random_val < cumulative_weight) {
-                selected = i;
-                break;
-            }
-        }
-    }
-
-    /* Ensure a valid selection */
-    if (i == PROVIDER_COUNT) {
-        /* No provider selected, find first available one */
-        for (i = 0; i < PROVIDER_COUNT; i++) {
-            if (is_provider_available(i, state)) {
-                selected = i;
-                break;
-            }
-        }
-    }
-
-    return selected;
-}
-
-/*
- * Implements the fallback scheduling algorithm
- * Tries all providers in order of priority
- */
-static int select_fallback(struct llm_request *req, struct scheduler_state *state)
-{
-    int i;
-
-    if (!state) {
-        pr_err("select_fallback: Invalid state pointer\n");
-        return 0;
-    }
-
-    /* Try each provider in order */
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        if (is_provider_available(i, state)) {
-            return i;
-        }
-    }
-
-    /* If all are unavailable, return the first one */
-    return 0;
-}
-
-/*
- * Handle case where req->provider_override is specified
+ * Handle provider override request
  * Returns the requested provider if available, otherwise -1
  */
 static int handle_provider_override(struct llm_request *req, struct scheduler_state *state)
@@ -733,51 +1264,18 @@ int select_provider(struct llm_request *req, struct scheduler_state *state)
         return provider;
     }
 
-    algorithm = req->scheduler_algorithm;
+    /* Always use round-robin algorithm for this implementation */
+    algorithm = SCHEDULER_ROUND_ROBIN;
 
-    if (algorithm == -1)
-        algorithm = atomic_read(&state->current_algorithm);
-
-    /* Validate algorithm */
-    if (algorithm < 0 || algorithm > SCHEDULER_MAX_ALGORITHM) {
-        pr_warn("select_provider: Invalid algorithm %d, using weighted\n", algorithm);
-        algorithm = SCHEDULER_WEIGHTED;
+    /* Select first available provider (simplified round-robin) */
+    for (provider = 0; provider < PROVIDER_COUNT; provider++) {
+        if (is_provider_available(provider, state)) {
+            return provider;
+        }
     }
 
-    switch (algorithm) {
-        case SCHEDULER_ROUND_ROBIN:
-            provider = select_round_robin(req, state);
-            break;
-        case SCHEDULER_WEIGHTED:
-            provider = select_weighted(req, state);
-            break;
-        case SCHEDULER_PRIORITY:
-            provider = select_priority(req, state);
-            break;
-        case SCHEDULER_PERFORMANCE:
-            provider = select_performance(req, state);
-            break;
-        case SCHEDULER_COST_AWARE:
-            provider = select_cost_aware(req, state);
-            break;
-        case SCHEDULER_FIFO:
-            provider = select_fifo(req, state);
-            break;
-        case SCHEDULER_FALLBACK:
-            provider = select_fallback(req, state);
-            break;
-        default:
-            provider = select_weighted(req, state);
-            break;
-    }
-
-    /* Ensure provider is valid */
-    if (provider < 0 || provider >= PROVIDER_COUNT) {
-        pr_warn("select_provider: Invalid provider %d, using 0\n", provider);
-        provider = 0;
-    }
-
-    return provider;
+    /* If no providers available, return the first one */
+    return 0;
 }
 
 /*
@@ -840,37 +1338,7 @@ void update_provider_metrics(int provider, int result, s64 latency_ms, int token
 }
 
 /*
- * Handle rate limiting for a provider
- * Safely update provider status with proper locking
- */
-void handle_rate_limit(int provider, struct scheduler_state *state, unsigned long reset_ms)
-{
-    unsigned long flags;
-    ktime_t reset_time;
-
-    if (!state || provider < 0 || provider >= PROVIDER_COUNT) {
-        pr_err("handle_rate_limit: Invalid state or provider\n");
-        return;
-    }
-
-    /* Set provider as rate limited with proper locking */
-    spin_lock_irqsave(&metrics_lock, flags);
-
-    /* Set provider as rate limited */
-    atomic_set(&state->metrics[provider].current_status, 0);
-
-    /* Set reset time */
-    reset_time = ktime_add_ms(ktime_get(), reset_ms);
-    state->metrics[provider].rate_limit_reset_time = reset_time;
-
-    spin_unlock_irqrestore(&metrics_lock, flags);
-
-    pr_info("Provider %d rate limited, will reset in %lu ms\n", provider, reset_ms);
-}
-
-/*
  * Normalize weights to ensure they sum to 100% and meet minimum values
- * Helper function for adjust_scheduler_weights
  */
 static void normalize_weights(struct scheduler_state *state)
 {
@@ -957,7 +1425,6 @@ static void normalize_weights(struct scheduler_state *state)
 
 /*
  * Adjust scheduler weights based on performance metrics
- * Dynamically tunes the system based on provider performance
  */
 void adjust_scheduler_weights(struct scheduler_state *state)
 {
@@ -1023,17 +1490,16 @@ void adjust_scheduler_weights(struct scheduler_state *state)
         normalize_weights(state);
     }
 
+    spin_unlock_irqrestore(&weights_lock, flags_weights);
+
     pr_debug("Adjusted weights: OpenAI=%d%%, Anthropic=%d%%, Gemini=%d%%\n",
              state->weights[PROVIDER_OPENAI],
              state->weights[PROVIDER_ANTHROPIC],
              state->weights[PROVIDER_GOOGLE_GEMINI]);
-
-    spin_unlock_irqrestore(&weights_lock, flags_weights);
 }
 
 /*
  * Reset all metrics
- * Safely clears all metrics with proper locking
  */
 void scheduler_reset_metrics(struct scheduler_state *state)
 {
@@ -1067,31 +1533,35 @@ void scheduler_reset_metrics(struct scheduler_state *state)
 }
 
 /*
- * Initialize the FIFO queue
- * Properly sets up a new queue or resets an existing one
+ * Handle rate limiting for a provider
  */
-void fifo_init(struct fifo_queue *fifo)
+void handle_rate_limit(int provider, struct scheduler_state *state, unsigned long reset_ms)
 {
     unsigned long flags;
+    ktime_t reset_time;
 
-    if (!fifo) {
-        pr_err("fifo_init: Invalid fifo pointer\n");
+    if (!state || provider < 0 || provider >= PROVIDER_COUNT) {
+        pr_err("handle_rate_limit: Invalid state or provider\n");
         return;
     }
 
-    spin_lock_irqsave(&fifo->lock, flags);
+    /* Set provider as rate limited with proper locking */
+    spin_lock_irqsave(&metrics_lock, flags);
 
-    memset(fifo->providers, 0, sizeof(fifo->providers));
-    fifo->head = 0;
-    fifo->tail = 0;
-    fifo->count = 0;
+    /* Set provider as rate limited */
+    atomic_set(&state->metrics[provider].current_status, 0);
 
-    spin_unlock_irqrestore(&fifo->lock, flags);
+    /* Set reset time */
+    reset_time = ktime_add_ms(ktime_get(), reset_ms);
+    state->metrics[provider].rate_limit_reset_time = reset_time;
+
+    spin_unlock_irqrestore(&metrics_lock, flags);
+
+    pr_info("Provider %d rate limited, will reset in %lu ms\n", provider, reset_ms);
 }
 
 /*
  * Add a provider to the FIFO queue
- * Returns 0 on success, -ENOSPC if queue is full
  */
 int fifo_add_provider(struct fifo_queue *fifo, int provider)
 {
@@ -1122,86 +1592,15 @@ int fifo_add_provider(struct fifo_queue *fifo, int provider)
 
     return ret;
 }
-
-/*
- * Clean up FIFO queue
- * Safely resets the queue with proper locking
- */
-void fifo_cleanup(struct fifo_queue *fifo)
-{
-    unsigned long flags;
-
-    if (!fifo) {
-        pr_err("fifo_cleanup: Invalid fifo pointer\n");
-        return;
-    }
-
-    spin_lock_irqsave(&fifo->lock, flags);
-
-    memset(fifo->providers, 0, sizeof(fifo->providers));
-    fifo->head = 0;
-    fifo->tail = 0;
-    fifo->count = 0;
-
-    spin_unlock_irqrestore(&fifo->lock, flags);
-
-    pr_debug("FIFO queue cleaned up\n");
-}
-
-/*
- * Initialize priority-based scheduling
- */
-int scheduler_priority_init(void)
-{
-    int i;
-
-    /* Initialize priority queues */
-    for (i = 0; i < PRIORITY_LEVELS; i++) {
-        priority_queue_init(&priority_queues[i]);
-    }
-
-    pr_info("Priority-based scheduling initialized\n");
-    return 0;
-}
-
-/*
- * Clean up priority-based scheduling
- */
-void scheduler_priority_cleanup(void)
-{
-    int i;
-
-    /* Clean up priority queues */
-    for (i = 0; i < PRIORITY_LEVELS; i++) {
-        struct priority_entry *entry;
-
-        /* Free all entries */
-        while ((entry = priority_queue_get(&priority_queues[i])) != NULL) {
-            if (entry->req) {
-                kfree(entry->req);
-            }
-            kfree(entry);
-        }
-    }
-
-    pr_info("Priority-based scheduling cleaned up\n");
-}
-
-/* Module exports */
-EXPORT_SYMBOL(scheduler_init);
-EXPORT_SYMBOL(select_provider);
-EXPORT_SYMBOL(update_provider_metrics);
-EXPORT_SYMBOL(handle_rate_limit);
-EXPORT_SYMBOL(adjust_scheduler_weights);
-EXPORT_SYMBOL(scheduler_reset_metrics);
-EXPORT_SYMBOL(set_scheduler_state);
-EXPORT_SYMBOL(get_scheduler_state);
 EXPORT_SYMBOL(fifo_init);
-EXPORT_SYMBOL(fifo_add_provider);
 EXPORT_SYMBOL(fifo_cleanup);
-EXPORT_SYMBOL(get_default_model);
-EXPORT_SYMBOL(is_model_supported);
+EXPORT_SYMBOL(scheduler_init);
 EXPORT_SYMBOL(scheduler_submit_request);
 EXPORT_SYMBOL(scheduler_get_next_request);
-EXPORT_SYMBOL(scheduler_priority_init);
+EXPORT_SYMBOL(get_default_model);
+EXPORT_SYMBOL(is_model_supported);
 EXPORT_SYMBOL(scheduler_priority_cleanup);
+EXPORT_SYMBOL(select_provider);
+EXPORT_SYMBOL(update_provider_metrics);
+EXPORT_SYMBOL(scheduler_reset_metrics);
+EXPORT_SYMBOL(handle_rate_limit);

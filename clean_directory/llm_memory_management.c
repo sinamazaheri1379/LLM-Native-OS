@@ -584,7 +584,12 @@ ssize_t memory_limits_store(struct device *dev, struct device_attribute *attr,
 
     return count;
 }
+bool memory_management_initialized(void)
+{
+    return g_initialized;  /* assuming g_initialized is your initialization flag */
+}
 
+EXPORT_SYMBOL(memory_management_initialized);
 EXPORT_SYMBOL(context_register_memory);
 EXPORT_SYMBOL(context_unregister_memory);
 EXPORT_SYMBOL(context_get_memory_stats);
