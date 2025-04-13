@@ -36,10 +36,19 @@ static struct class *orchestrator_class;
 static struct device *orchestrator_device;
 static struct cdev orchestrator_cdev;
 static DEFINE_MUTEX(orchestrator_mutex);
+/* Response storage */
+struct response_entry {
+    int conversation_id;
+    int request_id;
+    struct llm_response response;
+    atomic_t complete;
+    struct hlist_node node;
+};
 
+static DEFINE_HASHTABLE(response_table, 8);  /* 256 buckets for responses */
+static DEFINE_SPINLOCK(response_lock);
 /* Global state */
 static struct scheduler_state global_scheduler;
-static struct llm_response global_response;
 
 /* Maintenance timer */
 static struct timer_list maintenance_timer;
@@ -245,24 +254,6 @@ void remove_scheduler_state(void)
 
     spin_unlock(&scheduler_registry_lock);
 }
-static ssize_t provider_host_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    ssize_t len = 0;
-    int i;
-
-    len += scnprintf(buf + len, PAGE_SIZE - len, "Provider Host Configurations:\n");
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        len += scnprintf(buf + len, PAGE_SIZE - len,
-                      "%d: %s => %s:%d, path: %s\n",
-                      i, provider_configs[i].domain_name,
-                      provider_configs[i].host_ip,
-                      provider_configs[i].port,
-                      provider_configs[i].path);
-    }
-
-    return len;
-}
 
 static ssize_t provider_host_store(struct device *dev, struct device_attribute *attr,
                                  const char *buf, size_t count)
@@ -304,7 +295,240 @@ static ssize_t provider_host_store(struct device *dev, struct device_attribute *
 
     return count;
 }
+/* Global state */
+static atomic_t scheduler_running = ATOMIC_INIT(0);
+static struct task_struct *dispatcher_thread;
+static struct task_struct *provider_threads[PROVIDER_COUNT];
+static wait_queue_head_t dispatcher_wait_queue;
+static wait_queue_head_t provider_wait_queues[PROVIDER_COUNT];
+static struct request_queue provider_queues[PROVIDER_COUNT];
+static spinlock_t provider_queue_locks[PROVIDER_COUNT];
+static atomic_t provider_available[PROVIDER_COUNT];
 
+/* Queue for each provider */
+struct request_queue {
+    struct llm_request *request;   /* Current request */
+    atomic_t has_request;          /* Flag indicating if request is present */
+};
+
+/* Module initialization */
+static int __init cpu_scheduler_init(void)
+{
+    int i, ret;
+
+    /* Initialize wait queues */
+    init_waitqueue_head(&dispatcher_wait_queue);
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        init_waitqueue_head(&provider_wait_queues[i]);
+        spin_lock_init(&provider_queue_locks[i]);
+        atomic_set(&provider_available[i], 1);
+        provider_queues[i].request = NULL;
+        atomic_set(&provider_queues[i].has_request, 0);
+    }
+
+    /* Create provider worker threads */
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        provider_threads[i] = kthread_run(provider_worker_thread,
+                                         (void *)(long)i,
+                                         "llm_worker_%d", i);
+        if (IS_ERR(provider_threads[i])) {
+            ret = PTR_ERR(provider_threads[i]);
+            pr_err("Failed to create provider worker thread %d: %d\n", i, ret);
+            goto fail_workers;
+        }
+    }
+
+    /* Create dispatcher thread */
+    dispatcher_thread = kthread_run(dispatcher_thread_fn, NULL, "llm_dispatcher");
+    if (IS_ERR(dispatcher_thread)) {
+        ret = PTR_ERR(dispatcher_thread);
+        pr_err("Failed to create dispatcher thread: %d\n", ret);
+        goto fail_dispatcher;
+    }
+
+    atomic_set(&scheduler_running, 1);
+    pr_info("CPU-like LLM scheduler initialized\n");
+    return 0;
+
+fail_dispatcher:
+    i = PROVIDER_COUNT;
+
+fail_workers:
+    atomic_set(&scheduler_running, 0);
+    while (--i >= 0) {
+        if (!IS_ERR_OR_NULL(provider_threads[i]))
+            kthread_stop(provider_threads[i]);
+    }
+    return ret;
+}
+
+/* Dispatcher thread function */
+static int dispatcher_thread_fn(void *data)
+{
+    while (!kthread_should_stop()) {
+        struct llm_request *req;
+        int provider_id = -1;
+        int i;
+
+        /* Check if there are any requests waiting */
+        atomic_set(&next_request_waiting, 0);
+
+        /* Get next request using existing scheduler function */
+        req = scheduler_get_next_request();
+        if (!req) {
+            /* No requests, wait for notification */
+            wait_event_interruptible_timeout(
+                dispatcher_wait_queue,
+                kthread_should_stop(),
+                msecs_to_jiffies(100)
+            );
+            continue;
+        }
+
+        /* Find available provider */
+        for (i = 0; i < PROVIDER_COUNT; i++) {
+            if (atomic_read(&provider_available[i])) {
+                provider_id = i;
+                break;
+            }
+        }
+
+        /* If provider override is specified, check if it's available */
+        if (req->provider_override >= 0 &&
+            req->provider_override < PROVIDER_COUNT) {
+            if (atomic_read(&provider_available[req->provider_override])) {
+                provider_id = req->provider_override;
+            } else {
+                /* If specified provider is unavailable, requeue and wait */
+                scheduler_submit_request(req, req->priority);
+                kfree(req); /* Free the copy returned by scheduler_get_next_request */
+                msleep(100);
+                continue;
+            }
+        }
+
+        /* If no providers available, requeue and wait */
+        if (provider_id < 0) {
+            scheduler_submit_request(req, req->priority);
+            kfree(req); /* Free the copy returned by scheduler_get_next_request */
+            msleep(100);
+            continue;
+        }
+
+        /* Assign request to provider */
+        spin_lock(&provider_queue_locks[provider_id]);
+        if (provider_queues[provider_id].request != NULL) {
+            /* This shouldn't happen if available flag is accurate */
+            pr_warn("Provider %d queue not empty despite available flag\n", provider_id);
+            scheduler_submit_request(req, req->priority);
+            kfree(req);
+            spin_unlock(&provider_queue_locks[provider_id]);
+            continue;
+        }
+
+        provider_queues[provider_id].request = req;
+        atomic_set(&provider_queues[provider_id].has_request, 1);
+        spin_unlock(&provider_queue_locks[provider_id]);
+
+        /* Wake up provider worker */
+        wake_up(&provider_wait_queues[provider_id]);
+    }
+
+    return 0;
+}
+
+/* Provider worker thread function */
+static int provider_worker_thread(void *data)
+{
+    int provider_id = (int)(long)data;
+
+    while (!kthread_should_stop()) {
+        struct llm_request *req = NULL;
+        const char *api_key;
+        struct llm_response resp;
+        int ret;
+
+        /* Wait for request */
+        wait_event_interruptible_timeout(
+            provider_wait_queues[provider_id],
+            atomic_read(&provider_queues[provider_id].has_request) ||
+            kthread_should_stop(),
+            msecs_to_jiffies(100)
+        );
+
+        if (kthread_should_stop())
+            break;
+
+        /* Check if we have a request */
+        if (!atomic_read(&provider_queues[provider_id].has_request))
+            continue;
+
+        /* Mark provider as busy */
+        atomic_set(&provider_available[provider_id], 0);
+
+        /* Get request */
+        spin_lock(&provider_queue_locks[provider_id]);
+        req = provider_queues[provider_id].request;
+        provider_queues[provider_id].request = NULL;
+        atomic_set(&provider_queues[provider_id].has_request, 0);
+        spin_unlock(&provider_queue_locks[provider_id]);
+
+        if (!req) {
+            atomic_set(&provider_available[provider_id], 1);
+            continue;
+        }
+
+        /* Get API key */
+        switch (provider_id) {
+            case PROVIDER_OPENAI:
+                api_key = openai_api_key;
+                break;
+            case PROVIDER_ANTHROPIC:
+                api_key = anthropic_api_key;
+                break;
+            case PROVIDER_GOOGLE_GEMINI:
+                api_key = google_gemini_api_key;
+                break;
+            default:
+                api_key = NULL;
+        }
+
+        /* Process request */
+        memset(&resp, 0, sizeof(resp));
+        switch (provider_id) {
+            case PROVIDER_OPENAI:
+                ret = llm_send_openai(api_key, req, &resp);
+                break;
+            case PROVIDER_ANTHROPIC:
+                ret = llm_send_anthropic(api_key, req, &resp);
+                break;
+            case PROVIDER_GOOGLE_GEMINI:
+                ret = llm_send_google_gemini(api_key, req, &resp);
+                break;
+            default:
+                ret = -EINVAL;
+        }
+
+        /* Handle rate limiting */
+        if (ret == -LLM_ERR_RATE_LIMIT) {
+            struct scheduler_state *state = get_scheduler_state();
+            if (state) {
+                handle_rate_limit(provider_id, state, resp.rate_limit_reset_ms);
+            }
+        } else {
+            /* Mark provider as available */
+            atomic_set(&provider_available[provider_id], 1);
+        }
+
+        /* Store response in requestor's buffer */
+        store_response(req, &resp);
+
+        /* Free request */
+        kfree(req);
+    }
+
+    return 0;
+}
 
 /* OpenAI API implementation */
 int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_response *resp)
@@ -830,19 +1054,16 @@ static int orchestrate_request(struct llm_request *req, struct llm_response *res
     if (req->scheduler_algorithm == SCHEDULER_FALLBACK) {
         /* Try each provider in sequence */
         ret = llm_send_openai(openai_api_key, req, resp);
-        update_provider_metrics(PROVIDER_OPENAI, ret, resp->latency_ms, resp->tokens_used);
         if (ret == 0)
             return ret;
 
         pr_warn("orchestrate_request: OpenAI failed (ret=%d), trying Anthropic\n", ret);
         ret = llm_send_anthropic(anthropic_api_key, req, resp);
-        update_provider_metrics(PROVIDER_ANTHROPIC, ret, resp->latency_ms, resp->tokens_used);
         if (ret == 0)
             return ret;
 
         pr_warn("orchestrate_request: Anthropic failed (ret=%d), trying Gemini\n", ret);
         ret = llm_send_google_gemini(google_gemini_api_key, req, resp);
-        update_provider_metrics(PROVIDER_GOOGLE_GEMINI, ret, resp->latency_ms, resp->tokens_used);
         return ret;
     }
 
@@ -869,7 +1090,6 @@ static int orchestrate_request(struct llm_request *req, struct llm_response *res
                 break;
         }
 
-        update_provider_metrics(provider, ret, resp->latency_ms, resp->tokens_used);
 
         if (ret == 0)
             break;
@@ -945,97 +1165,89 @@ static int orchestrator_release(struct inode *inode, struct file *file)
 }
 
 /* Updated orchestrator_write function */
+/* Modified write function for client interface */
 static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
 {
-    struct llm_request* req;
+    struct llm_request user_req;
     struct llm_response_wrapper *wrapper = file->private_data;
     int ret;
 
-    if (!wrapper)
+    if (!wrapper || count != sizeof(struct llm_request))
         return -EINVAL;
 
-    if (count != sizeof(struct llm_request)){
-        return -EINVAL;
-    }
-
-    req = kmalloc(sizeof(struct llm_request), GFP_KERNEL);
-    if (!req){
-        return -ENOMEM;
-    }
-
-    if (copy_from_user(req, buf, sizeof(*req))) {
-        kfree(req);
+    /* Copy and validate request from user */
+    if (copy_from_user(&user_req, buf, sizeof(user_req)))
         return -EFAULT;
-    }
 
-    /* Set request priority from wrapper (can be changed via ioctl) */
-    req->priority = wrapper->priority;
-
-    /* Set preferred provider from wrapper if not explicitly set in request */
-    if (req->provider_override < 0 && wrapper->preferred_provider >= 0) {
-        req->provider_override = wrapper->preferred_provider;
-    }
-
-    /* Validation code */
-    if (req->conversation_id <= 0) {
-        pr_err("orchestrator_write: Invalid conversation_id: %d\n", req->conversation_id);
-        kfree(req);
+    /* Validate request fields */
+    if (user_req.conversation_id <= 0 || user_req.prompt[0] == '\0')
         return -EINVAL;
-    }
 
-    /* Validate prompt - ensure it's not empty and is null-terminated */
-    if (req->prompt[0] == '\0') {
-        pr_err("orchestrator_write: Empty prompt\n");
-        kfree(req);
-        return -EINVAL;
-    }
-    req->prompt[MAX_PROMPT_LENGTH - 1] = '\0';
+    /* Override priority from wrapper */
+    user_req.priority = wrapper->priority;
 
-    /* Validate role - use default if empty */
-    if (req->role[0] == '\0') {
-        strscpy(req->role, "user", MAX_ROLE_NAME);
-    } else {
-        req->role[MAX_ROLE_NAME - 1] = '\0';
-    }
-
-    /* Validate model name - if empty, we'll use a default in the provider code */
-    req->model_name[MAX_MODEL_NAME - 1] = '\0';
-
-    /* Validate and set reasonable defaults for numeric parameters */
-    if (req->max_tokens <= 0 || req->max_tokens > 32000) {
-        req->max_tokens = 4000; /* Reasonable default */
-    }
-
-    if (req->temperature_x100 <= 0 || req->temperature_x100 > 200) {
-        req->temperature_x100 = 70; /* Default to 0.7 */
-    }
-
-    if (req->timeout_ms <= 0) {
-        req->timeout_ms = 30000; /* 30 seconds default */
-    } else if (req->timeout_ms > 300000) {
-        req->timeout_ms = 300000; /* Cap at 5 minutes */
-    }
-
-    /* Validate scheduler algorithm */
-    if (req->scheduler_algorithm != -1 && (req->scheduler_algorithm < 0 || req->scheduler_algorithm > SCHEDULER_MAX_ALGORITHM)) {
-        pr_warn("orchestrator_write: Invalid scheduler algorithm: %d, using default\n",
-                req->scheduler_algorithm);
-        req->scheduler_algorithm = -1; /* Use default from state */
-    }
+    /* Override provider if set via ioctl */
+    if (user_req.provider_override < 0 && wrapper->preferred_provider >= 0)
+        user_req.provider_override = wrapper->preferred_provider;
 
     /* Reset completion flag */
     atomic_set(&wrapper->completed, 0);
 
-    /* Process request using file-specific response buffer */
-    mutex_lock(&orchestrator_mutex);
-    ret = orchestrate_request(req, &wrapper->resp);
-    mutex_unlock(&orchestrator_mutex);
+    /* Submit to scheduler directly - NON-BLOCKING */
+    ret = scheduler_submit_request(&user_req, user_req.priority);
+    if (ret < 0)
+        return ret;
 
-    /* Mark as completed regardless of result */
-    atomic_set(&wrapper->completed, 1);
+    /* Wake up dispatcher */
+    wake_up(&dispatcher_wait_queue);
 
-    kfree(req);
-    return ret < 0 ? ret : count;
+    return count;
+}
+
+/* Store response for a request */
+static void store_response(struct llm_request *req, struct llm_response *resp)
+{
+    struct response_entry *entry;
+    unsigned long flags;
+
+    /* Allocate response entry */
+    entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry)
+        return;
+
+    /* Initialize entry */
+    entry->conversation_id = req->conversation_id;
+    entry->request_id = req->request_id;
+    memcpy(&entry->response, resp, sizeof(*resp));
+    atomic_set(&entry->complete, 1);
+
+    /* Add to hash table */
+    spin_lock_irqsave(&response_lock, flags);
+    hash_add(response_table, &entry->node, entry->request_id);
+    spin_unlock_irqrestore(&response_lock, flags);
+
+    /* Mark the request complete in wrapper */
+    mark_request_complete(req->request_id);
+}
+/* Mark request as complete in wrapper */
+static void mark_request_complete(int request_id)
+{
+    struct file *file;
+    struct llm_response_wrapper *wrapper;
+
+    /* This requires a mechanism to map request_id to file */
+    /* For simplicity, we can maintain a hash table of request_id -> file */
+
+    file = find_file_by_request_id(request_id);
+    if (!file)
+        return;
+
+    wrapper = file->private_data;
+    if (wrapper) {
+        atomic_set(&wrapper->completed, 1);
+        /* Copy response to wrapper */
+        copy_response_to_wrapper(request_id, wrapper);
+    }
 }
 
 /* Updated orchestrator_read function with thread safety */
@@ -1048,16 +1260,23 @@ static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t cou
     if (!wrapper)
         return -EINVAL;
 
-    /* No mutex needed here since each file has its own response buffer */
-
-    if (wrapper->resp.content_length == 0) {
-        return 0;
-    }
-
     /* Wait for completion if necessary */
     if (!atomic_read(&wrapper->completed)) {
-        pr_debug("orchestrator_read: Request not completed yet\n");
-        return -EAGAIN;
+        if (file->f_flags & O_NONBLOCK)
+            return -EAGAIN;
+
+        /* Wait for completion with timeout */
+        ret = wait_event_interruptible_timeout(
+            read_wait_queue,
+            atomic_read(&wrapper->completed) != 0,
+            msecs_to_jiffies(30000)  /* 30-second timeout */
+        );
+
+        if (ret == 0)
+            return -ETIMEDOUT;
+
+        if (ret < 0)
+            return ret;
     }
 
     /* Allocate buffer for the extracted content */
@@ -1171,228 +1390,6 @@ static long orchestrator_ioctl(struct file *file, unsigned int cmd, unsigned lon
     }
 }
 
-static ssize_t scheduler_algorithm_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    int algorithm = atomic_read(&global_scheduler.current_algorithm);
-    const char *algorithm_name;
-
-    switch (algorithm) {
-        case SCHEDULER_ROUND_ROBIN:
-            algorithm_name = "Round Robin";
-            break;
-        case SCHEDULER_WEIGHTED:
-            algorithm_name = "Weighted";
-            break;
-        case SCHEDULER_PRIORITY:
-            algorithm_name = "Priority";
-            break;
-        case SCHEDULER_PERFORMANCE:
-            algorithm_name = "Performance";
-            break;
-        case SCHEDULER_COST_AWARE:
-            algorithm_name = "Cost Aware";
-            break;
-        case SCHEDULER_FALLBACK:
-            algorithm_name = "Fallback";
-            break;
-        case SCHEDULER_FIFO:
-            algorithm_name = "FIFO";
-            break;
-        default:
-            algorithm_name = "Unknown";
-            break;
-    }
-
-    return scnprintf(buf, PAGE_SIZE, "Current algorithm: %s (%d)\n", algorithm_name, algorithm);
-}
-
-/* Sets the scheduler algorithm */
-static ssize_t scheduler_algorithm_store(struct device *dev, struct device_attribute *attr,
-                                        const char *buf, size_t count)
-{
-    int algorithm;
-    int ret;
-
-    ret = kstrtoint(buf, 10, &algorithm);
-    if (ret < 0)
-        return ret;
-
-    if (algorithm < 0 || algorithm > SCHEDULER_MAX_ALGORITHM)
-        return -EINVAL;
-
-    atomic_set(&global_scheduler.current_algorithm, algorithm);
-    return count;
-}
-
-/* Shows provider metrics */
-static ssize_t provider_metrics_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    int i;
-    ssize_t len = 0;
-    const char *provider_names[PROVIDER_COUNT] = {"OpenAI", "Anthropic", "Google Gemini"};
-
-    len += scnprintf(buf + len, PAGE_SIZE - len, "Provider Metrics:\n");
-    len += scnprintf(buf + len, PAGE_SIZE - len, "----------------\n");
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        int total = atomic_read(&global_scheduler.metrics[i].total_requests);
-        int successful = atomic_read(&global_scheduler.metrics[i].successful_requests);
-        int failed = atomic_read(&global_scheduler.metrics[i].failed_requests);
-        int timeouts = atomic_read(&global_scheduler.metrics[i].timeouts);
-        int rate_limited = atomic_read(&global_scheduler.metrics[i].rate_limited);
-        int status = atomic_read(&global_scheduler.metrics[i].current_status);
-        s64 total_latency = atomic64_read(&global_scheduler.metrics[i].total_latency_ms);
-        s64 avg_latency = total < 1 ? 0 : div64_s64(total_latency, max(successful, 1));
-        int tokens = atomic_read(&global_scheduler.metrics[i].total_tokens);
-
-        len += scnprintf(buf + len, PAGE_SIZE - len, "\n%s:\n", provider_names[i]);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Status: %s\n",
-                        status ? "Available" : "Rate Limited");
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Total Requests: %d\n", total);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Successful: %d\n", successful);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Failed: %d\n", failed);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Timeouts: %d\n", timeouts);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Rate Limited: %d\n", rate_limited);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Success Rate: %d%%\n",
-                        total > 0 ? (successful * 100) / total : 0);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Avg Latency: %lld ms\n", avg_latency);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Min Latency: %lu ms\n",
-                        global_scheduler.metrics[i].min_latency_ms == ULONG_MAX ? 0 :
-                        global_scheduler.metrics[i].min_latency_ms);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Max Latency: %lu ms\n",
-                        global_scheduler.metrics[i].max_latency_ms);
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  Total Tokens: %d\n", tokens);
-    }
-
-    return len;
-}
-
-/* Resets provider metrics */
-static ssize_t reset_metrics_store(struct device *dev, struct device_attribute *attr,
-                                 const char *buf, size_t count)
-{
-    if (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y') {
-        scheduler_reset_metrics(&global_scheduler);
-        pr_info("LLM Orchestrator: Provider metrics reset\n");
-    }
-    return count;
-}
-
-/* Shows scheduler weights */
-static ssize_t scheduler_weights_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    const char *provider_names[PROVIDER_COUNT] = {"OpenAI", "Anthropic", "Google Gemini"};
-    int i;
-    ssize_t len = 0;
-    int total = 0;
-
-    len += scnprintf(buf + len, PAGE_SIZE - len, "Provider Weights:\n");
-
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        len += scnprintf(buf + len, PAGE_SIZE - len, "  %s: %d%%\n",
-                       provider_names[i], global_scheduler.weights[i]);
-        total += global_scheduler.weights[i];
-    }
-
-    len += scnprintf(buf + len, PAGE_SIZE - len, "Total: %d%%\n", total);
-    len += scnprintf(buf + len, PAGE_SIZE - len, "Auto-adjust: %s\n",
-                    global_scheduler.auto_adjust ? "Enabled" : "Disabled");
-
-    return len;
-}
-
-/* Sets scheduler weights */
-static ssize_t scheduler_weights_store(struct device *dev, struct device_attribute *attr,
-                                     const char *buf, size_t count)
-{
-    int w1, w2, w3;
-    int ret;
-
-    /* Format: "w1,w2,w3" for the three providers */
-    ret = sscanf(buf, "%d,%d,%d", &w1, &w2, &w3);
-    if (ret != 3)
-        return -EINVAL;
-
-    /* Validate weights */
-    if (w1 < 0 || w2 < 0 || w3 < 0)
-        return -EINVAL;
-    if (w1 + w2 + w3 != 100)
-        return -EINVAL;
-
-    /* Update weights */
-    global_scheduler.weights[0] = w1;
-    global_scheduler.weights[1] = w2;
-    global_scheduler.weights[2] = w3;
-
-    pr_info("LLM Orchestrator: Weights updated to %d%%,%d%%,%d%%\n", w1, w2, w3);
-    return count;
-}
-
-/* Shows auto-adjust setting */
-static ssize_t auto_adjust_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    return scnprintf(buf, PAGE_SIZE, "Auto-adjust: %s\n",
-                    global_scheduler.auto_adjust ? "Enabled" : "Disabled");
-}
-
-/* Sets auto-adjust setting */
-static ssize_t auto_adjust_store(struct device *dev, struct device_attribute *attr,
-                               const char *buf, size_t count)
-{
-    bool enable;
-
-    if (kstrtobool(buf, &enable))
-        return -EINVAL;
-
-    global_scheduler.auto_adjust = enable;
-    pr_info("LLM Orchestrator: Auto-adjust %s\n", enable ? "enabled" : "disabled");
-    return count;
-}
-
-/* Shows FIFO queue status */
-static ssize_t fifo_status_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    ssize_t len = 0;
-
-    len += scnprintf(buf + len, PAGE_SIZE - len, "FIFO Queue Status:\n");
-    len += scnprintf(buf + len, PAGE_SIZE - len, "  Queue Size: %d/%d\n",
-                    global_scheduler.fifo.count, MAX_FIFO_QUEUE_SIZE);
-    len += scnprintf(buf + len, PAGE_SIZE - len, "  Head: %d\n", global_scheduler.fifo.head);
-    len += scnprintf(buf + len, PAGE_SIZE - len, "  Tail: %d\n", global_scheduler.fifo.tail);
-
-    return len;
-}
-
-/* Shows context status */
-static ssize_t context_status_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    int total_conversations, total_entries, entries_added, entries_pruned;
-    context_get_stats(&total_conversations, &total_entries, &entries_added, &entries_pruned);
-
-    return scnprintf(buf, PAGE_SIZE,
-                   "Context Status:\n"
-                   "  Active Conversations: %d\n"
-                   "  Total Entries: %d\n"
-                   "  Entries Added: %d\n"
-                   "  Entries Pruned: %d\n"
-                   "  Auto-prune Threshold: %d minutes\n",
-                   total_conversations,
-                   total_entries,
-                   entries_added,
-                   entries_pruned,
-                   prune_threshold_mins);
-}
-
-/* Sysfs interfaces for configuration and statistics */
-static DEVICE_ATTR(scheduler_algorithm, 0644, scheduler_algorithm_show, scheduler_algorithm_store);
-static DEVICE_ATTR(provider_metrics, 0444, provider_metrics_show, NULL);
-static DEVICE_ATTR(reset_metrics, 0200, NULL, reset_metrics_store);
-static DEVICE_ATTR(scheduler_weights, 0644, scheduler_weights_show, scheduler_weights_store);
-static DEVICE_ATTR(auto_adjust, 0644, auto_adjust_show, auto_adjust_store);
-static DEVICE_ATTR(fifo_status, 0444, fifo_status_show, NULL);
-static DEVICE_ATTR(context_status, 0444, context_status_show, NULL);
-static DEVICE_ATTR(memory_stats, 0444, memory_stats_show, NULL);
-static DEVICE_ATTR(memory_limits, 0644, memory_limits_show, memory_limits_store);
 static DEVICE_ATTR(provider_hosts, 0644, provider_host_show, provider_host_store);
 /* Fix for module initialization order in orchestrator_init() in orchestrator_main.c */
 static int __init orchestrator_init(void)
@@ -1418,7 +1415,7 @@ static int __init orchestrator_init(void)
     }
     pr_info("LLM Orchestrator: JSON manager initialized\n");
 
-    /* Step 3: Initialize context management */
+    /* Step 3: InitializeF context management */
     ret = context_management_init();
     if (ret) {
         pr_err("orchestrator_init: Failed to initialize context management: %d\n", ret);
@@ -1453,7 +1450,6 @@ static int __init orchestrator_init(void)
     /* Step 7: Initialize scheduler and global state */
     scheduler_init(&global_scheduler);
     set_scheduler_state(&global_scheduler);
-    memset(&global_response, 0, sizeof(global_response));
     pr_info("LLM Orchestrator: Scheduler initialized\n");
     /* Step 8: Register character device */
    ret = alloc_chrdev_region(&dev, 0, 1, MODULE_NAME);
