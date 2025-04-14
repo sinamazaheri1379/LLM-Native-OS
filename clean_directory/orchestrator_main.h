@@ -9,6 +9,7 @@
 #include <linux/ktime.h>
 #include <linux/device.h>
 #include <linux/shrinker.h>
+#include <linux/delay.h>
 /* Constants for buffer sizes, error codes */
 #define DRIVER_VERSION "2.0"
 #define MAX_PROMPT_LENGTH 4096
@@ -61,6 +62,12 @@
 #define SCHEDULER_MAX_ALGORITHM SCHEDULER_FIFO
 /* Data structures for requests, responses, contexts */
 
+/* IOCTL commands */
+#define IOCTL_SET_PREFERRED_PROVIDER _IOW('L', 1, int)
+#define IOCTL_SET_REQUEST_PRIORITY   _IOW('L', 2, int)
+#define IOCTL_GET_REQUEST_STATUS     _IOR('L', 3, int)
+
+
 struct llm_provider_config {
     char domain_name[MAX_HOST_NAME];  /* Original domain name */
     char host_ip[MAX_IP_LENGTH];      /* Resolved IP address */
@@ -86,12 +93,13 @@ struct llm_request {
     char role[MAX_ROLE_NAME];
     char model_name[MAX_MODEL_NAME];
     int conversation_id;
+    int request_id;       // Add this field
     int max_tokens;
     int temperature_x100;
     unsigned long timeout_ms;
     int scheduler_algorithm;
     int priority;
-    int provider_override;  /* New field for preferred provider */
+    int provider_override;
 };
 
 struct llm_response {

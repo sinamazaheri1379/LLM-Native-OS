@@ -56,6 +56,7 @@ struct llm_request {
     char role[MAX_ROLE_NAME];
     char model_name[MAX_MODEL_NAME];
     int conversation_id;
+    int request_id;       // Add this field
     int max_tokens;
     int temperature_x100;
     unsigned long timeout_ms;
@@ -106,6 +107,7 @@ int send_request_and_get_response(int fd, const char *prompt, int conversation_i
     strncpy(req.prompt, prompt, MAX_PROMPT_LENGTH - 1);
     strncpy(req.role, "user", MAX_ROLE_NAME - 1);
     req.conversation_id = conversation_id;
+    req.request_id = 0;
     req.max_tokens = 1000;
     req.temperature_x100 = 70;  /* 0.7 */
     req.timeout_ms = 30000;     /* 30 seconds */

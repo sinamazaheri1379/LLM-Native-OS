@@ -1,3 +1,13 @@
+/**
+ * orchestrator_main.c - LLM Orchestrator with CPU-like Scheduling
+ *
+ * This implementation uses a CPU-like scheduling approach where:
+ * 1. Client threads submit requests through orchestrator_write()
+ * 2. Requests are queued in priority queues managed by the scheduler
+ * 3. A dispatcher thread assigns requests to provider worker threads
+ * 4. Each provider worker processes requests independently
+ */
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -6,10 +16,16 @@
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/timer.h>
+#include <linux/wait.h>
+#include <linux/kthread.h>
+#include <linux/slab.h>
 #include <linux/version.h>
+#include <linux/hashtable.h>
+#include <linux/ktime.h>
 #include "orchestrator_main.h"
 
 #define MODULE_NAME "llm_orchestrator"
+#define RESPONSE_HASH_BITS 8  /* 256 buckets */
 
 /* Module parameters */
 static char *openai_api_key = NULL;
@@ -28,30 +44,68 @@ static int prune_threshold_mins = 60; /* 1 hour */
 module_param(prune_threshold_mins, int, 0600);
 MODULE_PARM_DESC(prune_threshold_mins, "Auto-prune threshold for old conversations in minutes (0 to disable)");
 
-
-static char *secure_api_keys[3] = { NULL, NULL, NULL };
 /* Character device globals */
 static int major_number;
 static struct class *orchestrator_class;
 static struct device *orchestrator_device;
 static struct cdev orchestrator_cdev;
 static DEFINE_MUTEX(orchestrator_mutex);
+
+/* Global state */
+static struct scheduler_state global_scheduler;
+
+/* Maintenance timer */
+static struct timer_list maintenance_timer;
+
+/* CPU-like scheduler components */
+static atomic_t scheduler_running = ATOMIC_INIT(0);
+static struct task_struct *dispatcher_thread;
+static struct task_struct *provider_threads[PROVIDER_COUNT];
+static wait_queue_head_t dispatcher_wait_queue;
+static wait_queue_head_t provider_wait_queues[PROVIDER_COUNT];
+static wait_queue_head_t read_wait_queue; /* Wait queue for clients reading responses */
+static atomic_t next_request_waiting = ATOMIC_INIT(0);
+
+/* Queue for each provider */
+struct request_queue {
+    struct llm_request *request;   /* Current request */
+    atomic_t has_request;          /* Flag indicating if request is present */
+};
+
+static struct request_queue provider_queues[PROVIDER_COUNT];
+static spinlock_t provider_queue_locks[PROVIDER_COUNT];
+static atomic_t provider_available[PROVIDER_COUNT];
+
 /* Response storage */
 struct response_entry {
-    int conversation_id;
     int request_id;
     struct llm_response response;
     atomic_t complete;
     struct hlist_node node;
 };
 
-static DEFINE_HASHTABLE(response_table, 8);  /* 256 buckets for responses */
+static DEFINE_HASHTABLE(response_table, RESPONSE_HASH_BITS);
 static DEFINE_SPINLOCK(response_lock);
-/* Global state */
-static struct scheduler_state global_scheduler;
 
-/* Maintenance timer */
-static struct timer_list maintenance_timer;
+/* Request ID counter */
+static atomic_t request_counter = ATOMIC_INIT(0);
+
+/* File to request ID mapping */
+struct file_request_mapping {
+    struct file *file;
+    int request_id;
+    struct hlist_node node;
+};
+
+static DEFINE_HASHTABLE(file_request_map, RESPONSE_HASH_BITS);
+static DEFINE_SPINLOCK(file_map_lock);
+
+/* Provider configurations */
+struct llm_provider_config provider_configs[PROVIDER_COUNT] = {
+    { "api.openai.com", "127.0.0.1", 8080, "/v1/chat/completions" },      /* OpenAI */
+    { "api.anthropic.com", "127.0.0.1", 8080, "/v1/messages" },           /* Anthropic */
+    { "generativelanguage.googleapis.com", "127.0.0.1", 8080, "/v1/models/gemini-1.5-pro:generateContent" } /* Gemini */
+};
 
 /* Function prototypes */
 static int orchestrator_open(struct inode *inode, struct file *file);
@@ -59,40 +113,41 @@ static int orchestrator_release(struct inode *inode, struct file *file);
 static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t count, loff_t *offset);
 static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset);
 static long orchestrator_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
-/* Update file operations */
+static int dispatcher_thread_fn(void *data);
+static int provider_worker_thread(void *data);
+static void store_response(struct llm_request *req, struct llm_response *resp);
+static struct file *find_file_by_request_id(int request_id);
+static void mark_request_complete(int request_id);
+static void copy_response_to_wrapper(int request_id, struct llm_response_wrapper *wrapper);
+static ssize_t provider_host_show(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t provider_host_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t scheduler_algorithm_show(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t scheduler_algorithm_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static void maintenance_timer_callback(struct timer_list *t);
+
+/* Device attributes */
+static DEVICE_ATTR(provider_hosts, 0644, provider_host_show, provider_host_store);
+static DEVICE_ATTR(scheduler_algorithm, 0644, scheduler_algorithm_show, scheduler_algorithm_store);
+// Create a simple implementation for get_scheduler_state():
+struct scheduler_state *get_scheduler_state(void)
+{
+    return &global_scheduler;
+}
+
+// And remove_scheduler_state can be a no-op:
+void remove_scheduler_state(void)
+{
+    // No operation needed
+}
+
+/* File operations */
 static struct file_operations orchestrator_fops = {
     .owner = THIS_MODULE,
     .open = orchestrator_open,
     .release = orchestrator_release,
     .read = orchestrator_read,
     .write = orchestrator_write,
-    .unlocked_ioctl = orchestrator_ioctl, /* New ioctl handler */
-};
-
-/* Define IOCTL commands in orchestrator_main.h */
-#define IOCTL_SET_PREFERRED_PROVIDER _IOW('L', 1, int)
-#define IOCTL_SET_REQUEST_PRIORITY   _IOW('L', 2, int)
-#define IOCTL_GET_REQUEST_STATUS     _IOR('L', 3, int)
-#define IOCTL_GET_PROVIDER_STATS     _IOR('L', 4, struct provider_stat_info)
-/* You'll need to define provider_stat_info structure */
-
-/*
- * Implementation of provider-specific API functions
- * These were mentioned in header files but missing from the implementation
- */
-#define MAX_SCHEDULER_REGISTRY 64
-
-struct scheduler_registry_entry {
-    pid_t pid;
-    struct scheduler_state *state;
-    atomic_t in_use;
-};
-
-/* In orchestrator_main.c, add the provider configurations */
-struct llm_provider_config provider_configs[PROVIDER_COUNT] = {
-    { "api.openai.com", "127.0.0.1", 8080, "/openai/v1/chat/completions" },      /* OpenAI */
-    { "api.anthropic.com", "127.0.0.1", 8080, "/anthropic/v1/messages" },           /* Anthropic */
-    { "generativelanguage.googleapis.com", "127.0.0.1", 8080, "/gemini/v1/models/gemini-1.5-pro:generateContent" } /* Gemini */
+    .unlocked_ioctl = orchestrator_ioctl
 };
 
 /* Function to get provider configuration */
@@ -102,267 +157,7 @@ struct llm_provider_config *get_provider_config(int provider_id) {
     return NULL;
 }
 
-static struct scheduler_registry_entry scheduler_registry[MAX_SCHEDULER_REGISTRY];
-static DEFINE_SPINLOCK(scheduler_registry_lock);
-static atomic_t registry_initialized = ATOMIC_INIT(0);
-
-/* Initialize the scheduler registry */
-static int scheduler_registry_init(void)
-{
-    int i;
-
-    if (atomic_read(&registry_initialized) != 0)
-        return 0;  /* Already initialized */
-
-    spin_lock(&scheduler_registry_lock);
-
-    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
-        scheduler_registry[i].pid = 0;
-        scheduler_registry[i].state = NULL;
-        atomic_set(&scheduler_registry[i].in_use, 0);
-    }
-
-    spin_unlock(&scheduler_registry_lock);
-    atomic_set(&registry_initialized, 1);
-
-    pr_info("Scheduler registry initialized\n");
-    return 0;
-}
-
-/* Clean up the scheduler registry */
-static void scheduler_registry_cleanup(void)
-{
-    int i;
-
-    if (atomic_read(&registry_initialized) == 0)
-        return;  /* Not initialized */
-
-    spin_lock(&scheduler_registry_lock);
-
-    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
-        if (atomic_read(&scheduler_registry[i].in_use) != 0) {
-            scheduler_registry[i].pid = 0;
-            scheduler_registry[i].state = NULL;
-            atomic_set(&scheduler_registry[i].in_use, 0);
-        }
-    }
-
-    spin_unlock(&scheduler_registry_lock);
-    atomic_set(&registry_initialized, 0);
-
-    pr_info("Scheduler registry cleaned up\n");
-}
-
-/* Store scheduler state in registry */
-void set_scheduler_state(struct scheduler_state *state)
-{
-    int i, free_idx = -1;
-    pid_t current_pid;
-
-    if (!state || atomic_read(&registry_initialized) == 0) {
-        pr_err("set_scheduler_state: Registry not initialized or invalid state\n");
-        return;
-    }
-
-    current_pid = task_pid_nr(current);
-
-    spin_lock(&scheduler_registry_lock);
-
-    /* Check if entry already exists or find a free slot */
-    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
-        if (scheduler_registry[i].pid == current_pid &&
-            atomic_read(&scheduler_registry[i].in_use) != 0) {
-            /* Update existing entry */
-            scheduler_registry[i].state = state;
-            spin_unlock(&scheduler_registry_lock);
-            return;
-        }
-
-        if (free_idx == -1 && atomic_read(&scheduler_registry[i].in_use) == 0)
-            free_idx = i;
-    }
-
-    /* Add new entry if free slot found */
-    if (free_idx != -1) {
-        scheduler_registry[free_idx].pid = current_pid;
-        scheduler_registry[free_idx].state = state;
-        atomic_set(&scheduler_registry[free_idx].in_use, 1);
-        spin_unlock(&scheduler_registry_lock);
-        return;
-    }
-
-    spin_unlock(&scheduler_registry_lock);
-    pr_warn("set_scheduler_state: No free slots in registry\n");
-}
-
-/* Get scheduler state from registry */
-struct scheduler_state *get_scheduler_state(void)
-{
-    int i;
-    pid_t current_pid;
-    struct scheduler_state *state = NULL;
-
-    if (atomic_read(&registry_initialized) == 0) {
-        pr_err("get_scheduler_state: Registry not initialized\n");
-        return NULL;
-    }
-
-    current_pid = task_pid_nr(current);
-
-    spin_lock(&scheduler_registry_lock);
-
-    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
-        if (scheduler_registry[i].pid == current_pid &&
-            atomic_read(&scheduler_registry[i].in_use) != 0) {
-            state = scheduler_registry[i].state;
-            break;
-        }
-    }
-
-    spin_unlock(&scheduler_registry_lock);
-
-    /* If no entry found, use global scheduler as fallback */
-    if (!state) {
-        state = &global_scheduler;
-    }
-
-    return state;
-}
-
-/* Remove scheduler state from registry */
-void remove_scheduler_state(void)
-{
-    int i;
-    pid_t current_pid;
-
-    if (atomic_read(&registry_initialized) == 0)
-        return;
-
-    current_pid = task_pid_nr(current);
-
-    spin_lock(&scheduler_registry_lock);
-
-    for (i = 0; i < MAX_SCHEDULER_REGISTRY; i++) {
-        if (scheduler_registry[i].pid == current_pid &&
-            atomic_read(&scheduler_registry[i].in_use) != 0) {
-            scheduler_registry[i].pid = 0;
-            scheduler_registry[i].state = NULL;
-            atomic_set(&scheduler_registry[i].in_use, 0);
-            break;
-        }
-    }
-
-    spin_unlock(&scheduler_registry_lock);
-}
-
-static ssize_t provider_host_store(struct device *dev, struct device_attribute *attr,
-                                 const char *buf, size_t count)
-{
-    int provider, port;
-    char ip[MAX_IP_LENGTH];
-
-    if (sscanf(buf, "%d,%[^,],%d", &provider, ip, &port) != 3) {
-        pr_err("provider_host_store: Invalid format, expected: provider_id,ip,port\n");
-        return -EINVAL;
-    }
-
-    if (provider < 0 || provider >= PROVIDER_COUNT) {
-        pr_err("provider_host_store: Invalid provider ID: %d\n", provider);
-        return -EINVAL;
-    }
-
-    if (!is_ip_address_valid(ip)) {
-        pr_err("provider_host_store: Invalid IP address: %s\n", ip);
-        return -EINVAL;
-    }
-
-    if (port <= 0 || port > 65535) {
-        pr_err("provider_host_store: Invalid port: %d\n", port);
-        return -EINVAL;
-    }
-
-    /* Update the configuration */
-    mutex_lock(&orchestrator_mutex);
-
-    strncpy(provider_configs[provider].host_ip, ip, MAX_IP_LENGTH - 1);
-    provider_configs[provider].host_ip[MAX_IP_LENGTH - 1] = '\0';
-    provider_configs[provider].port = port;
-
-    mutex_unlock(&orchestrator_mutex);
-
-    pr_info("Updated provider %d (%s) to use IP: %s, port: %d\n",
-            provider, provider_configs[provider].domain_name, ip, port);
-
-    return count;
-}
-/* Global state */
-static atomic_t scheduler_running = ATOMIC_INIT(0);
-static struct task_struct *dispatcher_thread;
-static struct task_struct *provider_threads[PROVIDER_COUNT];
-static wait_queue_head_t dispatcher_wait_queue;
-static wait_queue_head_t provider_wait_queues[PROVIDER_COUNT];
-static struct request_queue provider_queues[PROVIDER_COUNT];
-static spinlock_t provider_queue_locks[PROVIDER_COUNT];
-static atomic_t provider_available[PROVIDER_COUNT];
-
-/* Queue for each provider */
-struct request_queue {
-    struct llm_request *request;   /* Current request */
-    atomic_t has_request;          /* Flag indicating if request is present */
-};
-
-/* Module initialization */
-static int __init cpu_scheduler_init(void)
-{
-    int i, ret;
-
-    /* Initialize wait queues */
-    init_waitqueue_head(&dispatcher_wait_queue);
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        init_waitqueue_head(&provider_wait_queues[i]);
-        spin_lock_init(&provider_queue_locks[i]);
-        atomic_set(&provider_available[i], 1);
-        provider_queues[i].request = NULL;
-        atomic_set(&provider_queues[i].has_request, 0);
-    }
-
-    /* Create provider worker threads */
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        provider_threads[i] = kthread_run(provider_worker_thread,
-                                         (void *)(long)i,
-                                         "llm_worker_%d", i);
-        if (IS_ERR(provider_threads[i])) {
-            ret = PTR_ERR(provider_threads[i]);
-            pr_err("Failed to create provider worker thread %d: %d\n", i, ret);
-            goto fail_workers;
-        }
-    }
-
-    /* Create dispatcher thread */
-    dispatcher_thread = kthread_run(dispatcher_thread_fn, NULL, "llm_dispatcher");
-    if (IS_ERR(dispatcher_thread)) {
-        ret = PTR_ERR(dispatcher_thread);
-        pr_err("Failed to create dispatcher thread: %d\n", ret);
-        goto fail_dispatcher;
-    }
-
-    atomic_set(&scheduler_running, 1);
-    pr_info("CPU-like LLM scheduler initialized\n");
-    return 0;
-
-fail_dispatcher:
-    i = PROVIDER_COUNT;
-
-fail_workers:
-    atomic_set(&scheduler_running, 0);
-    while (--i >= 0) {
-        if (!IS_ERR_OR_NULL(provider_threads[i]))
-            kthread_stop(provider_threads[i]);
-    }
-    return ret;
-}
-
-/* Dispatcher thread function */
+/* Dispatcher thread function - selects requests and assigns to provider workers */
 static int dispatcher_thread_fn(void *data)
 {
     while (!kthread_should_stop()) {
@@ -370,18 +165,16 @@ static int dispatcher_thread_fn(void *data)
         int provider_id = -1;
         int i;
 
-        /* Check if there are any requests waiting */
-        atomic_set(&next_request_waiting, 0);
-
-        /* Get next request using existing scheduler function */
+        /* Get next request from scheduler */
         req = scheduler_get_next_request();
         if (!req) {
             /* No requests, wait for notification */
             wait_event_interruptible_timeout(
                 dispatcher_wait_queue,
-                kthread_should_stop(),
+                atomic_read(&next_request_waiting) || kthread_should_stop(),
                 msecs_to_jiffies(100)
             );
+            atomic_set(&next_request_waiting, 0);
             continue;
         }
 
@@ -394,8 +187,7 @@ static int dispatcher_thread_fn(void *data)
         }
 
         /* If provider override is specified, check if it's available */
-        if (req->provider_override >= 0 &&
-            req->provider_override < PROVIDER_COUNT) {
+        if (req->provider_override >= 0 && req->provider_override < PROVIDER_COUNT) {
             if (atomic_read(&provider_available[req->provider_override])) {
                 provider_id = req->provider_override;
             } else {
@@ -437,7 +229,6 @@ static int dispatcher_thread_fn(void *data)
     return 0;
 }
 
-/* Provider worker thread function */
 static int provider_worker_thread(void *data)
 {
     int provider_id = (int)(long)data;
@@ -445,7 +236,7 @@ static int provider_worker_thread(void *data)
     while (!kthread_should_stop()) {
         struct llm_request *req = NULL;
         const char *api_key;
-        struct llm_response resp;
+        struct llm_response *resp; /* Changed to pointer */
         int ret;
 
         /* Wait for request */
@@ -478,6 +269,15 @@ static int provider_worker_thread(void *data)
             continue;
         }
 
+        /* Allocate response struct on the heap instead of stack */
+        resp = kmalloc(sizeof(struct llm_response), GFP_KERNEL);
+        if (!resp) {
+            pr_err("Failed to allocate response buffer\n");
+            atomic_set(&provider_available[provider_id], 1);
+            kfree(req);
+            continue;
+        }
+
         /* Get API key */
         switch (provider_id) {
             case PROVIDER_OPENAI:
@@ -494,16 +294,16 @@ static int provider_worker_thread(void *data)
         }
 
         /* Process request */
-        memset(&resp, 0, sizeof(resp));
+        memset(resp, 0, sizeof(struct llm_response));
         switch (provider_id) {
             case PROVIDER_OPENAI:
-                ret = llm_send_openai(api_key, req, &resp);
+                ret = llm_send_openai(api_key, req, resp);
                 break;
             case PROVIDER_ANTHROPIC:
-                ret = llm_send_anthropic(api_key, req, &resp);
+                ret = llm_send_anthropic(api_key, req, resp);
                 break;
             case PROVIDER_GOOGLE_GEMINI:
-                ret = llm_send_google_gemini(api_key, req, &resp);
+                ret = llm_send_google_gemini(api_key, req, resp);
                 break;
             default:
                 ret = -EINVAL;
@@ -513,7 +313,7 @@ static int provider_worker_thread(void *data)
         if (ret == -LLM_ERR_RATE_LIMIT) {
             struct scheduler_state *state = get_scheduler_state();
             if (state) {
-                handle_rate_limit(provider_id, state, resp.rate_limit_reset_ms);
+                handle_rate_limit(provider_id, state, resp->rate_limit_reset_ms);
             }
         } else {
             /* Mark provider as available */
@@ -521,15 +321,98 @@ static int provider_worker_thread(void *data)
         }
 
         /* Store response in requestor's buffer */
-        store_response(req, &resp);
+        store_response(req, resp);
 
-        /* Free request */
+        /* Free allocated memory */
+        kfree(resp);
         kfree(req);
     }
-
     return 0;
 }
 
+/* Store response for a request */
+static void store_response(struct llm_request *req, struct llm_response *resp)
+{
+    struct response_entry *entry;
+    unsigned long flags;
+
+    /* Allocate response entry */
+    entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry)
+        return;
+
+    /* Initialize entry */
+    entry->request_id = req->request_id;
+    memcpy(&entry->response, resp, sizeof(*resp));
+    atomic_set(&entry->complete, 1);
+
+    /* Add to hash table */
+    spin_lock_irqsave(&response_lock, flags);
+    hash_add(response_table, &entry->node, entry->request_id);
+    spin_unlock_irqrestore(&response_lock, flags);
+
+    /* Mark the request complete in wrapper */
+    mark_request_complete(req->request_id);
+}
+
+/* Find file associated with a request ID */
+static struct file *find_file_by_request_id(int request_id)
+{
+    struct file_request_mapping *mapping;
+    struct file *file = NULL;
+    unsigned long flags;
+
+    spin_lock_irqsave(&file_map_lock, flags);
+    hash_for_each_possible(file_request_map, mapping, node, request_id) {
+        if (mapping->request_id == request_id) {
+            file = mapping->file;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&file_map_lock, flags);
+
+    return file;
+}
+
+/* Mark request as complete and notify waiting clients */
+static void mark_request_complete(int request_id)
+{
+    struct file *file;
+    struct llm_response_wrapper *wrapper;
+
+    file = find_file_by_request_id(request_id);
+    if (!file)
+        return;
+
+    wrapper = file->private_data;
+    if (wrapper) {
+        atomic_set(&wrapper->completed, 1);
+        copy_response_to_wrapper(request_id, wrapper);
+        wake_up(&read_wait_queue);
+    }
+}
+
+/* Copy response data to wrapper */
+static void copy_response_to_wrapper(int request_id, struct llm_response_wrapper *wrapper)
+{
+    struct response_entry *entry;
+    unsigned long flags;
+    bool found = false;
+
+    spin_lock_irqsave(&response_lock, flags);
+    hash_for_each_possible(response_table, entry, node, request_id) {
+        if (entry->request_id == request_id) {
+            memcpy(&wrapper->resp, &entry->response, sizeof(struct llm_response));
+            found = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&response_lock, flags);
+
+    if (!found) {
+        pr_warn("copy_response_to_wrapper: No response found for request ID %d\n", request_id);
+    }
+}
 /* OpenAI API implementation */
 int llm_send_openai(const char *api_key, struct llm_request *req, struct llm_response *resp)
 {
@@ -1007,103 +890,6 @@ int llm_send_google_gemini(const char *api_key, struct llm_request *req, struct 
     json_buffer_free(&json_buf);
     return ret;
 }
-
-/* Clear all API keys securely */
-static void clear_all_api_keys(void)
-{
-    int i;
-
-    for (i = 0; i < 3; i++) {
-        if (secure_api_keys[i]) {
-            memzero_explicit(secure_api_keys[i], strlen(secure_api_keys[i]));
-            kfree(secure_api_keys[i]);
-            secure_api_keys[i] = NULL;
-        }
-    }
-}
-
-/* Modify orchestrate_request to use the response parameter */
-static int orchestrate_request(struct llm_request *req, struct llm_response *resp)
-{
-    int selected_provider, ret = -EINVAL;
-    int i;
-
-    /* Set default values if not provided */
-    req->timeout_ms = (req->timeout_ms > 0) ? req->timeout_ms : 30000;
-    if (req->temperature_x100 <= 0)
-        req->temperature_x100 = 70;
-
-    /* Initialize response */
-    memset(resp, 0, sizeof(*resp));
-    resp->timestamp = ktime_get();
-
-    /* If provider is explicitly specified and valid, use it */
-    if (req->provider_override >= 0 && req->provider_override < PROVIDER_COUNT) {
-        selected_provider = req->provider_override;
-    } else {
-        /* Select provider based on scheduling algorithm */
-        selected_provider = select_provider(req, &global_scheduler);
-    }
-
-    if (selected_provider < 0)
-        return selected_provider;
-
-    resp->provider_used = selected_provider;
-
-    /* Special handling for fallback algorithm */
-    if (req->scheduler_algorithm == SCHEDULER_FALLBACK) {
-        /* Try each provider in sequence */
-        ret = llm_send_openai(openai_api_key, req, resp);
-        if (ret == 0)
-            return ret;
-
-        pr_warn("orchestrate_request: OpenAI failed (ret=%d), trying Anthropic\n", ret);
-        ret = llm_send_anthropic(anthropic_api_key, req, resp);
-        if (ret == 0)
-            return ret;
-
-        pr_warn("orchestrate_request: Anthropic failed (ret=%d), trying Gemini\n", ret);
-        ret = llm_send_google_gemini(google_gemini_api_key, req, resp);
-        return ret;
-    }
-
-    /* Try the selected provider and fall back if needed */
-    for (i = 0; i < PROVIDER_COUNT; i++) {
-        int provider = (selected_provider + i) % PROVIDER_COUNT;
-        resp->provider_used = provider;
-
-        switch (provider) {
-            case PROVIDER_OPENAI:
-                pr_debug("orchestrate_request: Using OpenAI provider\n");
-                ret = llm_send_openai(openai_api_key, req, resp);
-                break;
-            case PROVIDER_ANTHROPIC:
-                pr_debug("orchestrate_request: Using Anthropic provider\n");
-                ret = llm_send_anthropic(anthropic_api_key, req, resp);
-                break;
-            case PROVIDER_GOOGLE_GEMINI:
-                pr_debug("orchestrate_request: Using Google Gemini provider\n");
-                ret = llm_send_google_gemini(google_gemini_api_key, req, resp);
-                break;
-            default:
-                ret = -EINVAL;
-                break;
-        }
-
-
-        if (ret == 0)
-            break;
-
-        if (i < PROVIDER_COUNT - 1) {
-            int next_provider = (selected_provider + i + 1) % PROVIDER_COUNT;
-            pr_warn("orchestrate_request: Provider %d failed (ret=%d), trying fallback %d\n",
-                    provider, ret, next_provider);
-        }
-    }
-
-    return ret;
-}
-
 /* Maintenance timer callback */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
 static void maintenance_timer_callback(struct timer_list *t)
@@ -1117,17 +903,10 @@ static void maintenance_timer_callback(unsigned long data)
     mod_timer(&maintenance_timer, jiffies + HZ * 60 * 10); /* Run every 10 minutes */
 }
 
-/* Request ID counter */
-static atomic_t request_counter = ATOMIC_INIT(0);
-
-/* Updated orchestrator_open function */
+/* File open operation */
 static int orchestrator_open(struct inode *inode, struct file *file)
 {
     struct llm_response_wrapper *wrapper;
-
-    /* Initialize registry if needed */
-    if (atomic_read(&registry_initialized) == 0)
-        scheduler_registry_init();
 
     /* Allocate and initialize response wrapper for this file */
     wrapper = kmalloc(sizeof(*wrapper), GFP_KERNEL);
@@ -1142,16 +921,27 @@ static int orchestrator_open(struct inode *inode, struct file *file)
 
     /* Store wrapper in file's private data */
     file->private_data = wrapper;
-
-    /* Store scheduler state in registry */
-    set_scheduler_state(&global_scheduler);
     return 0;
 }
 
-/* Updated orchestrator_release function */
+/* File release operation */
 static int orchestrator_release(struct inode *inode, struct file *file)
 {
     struct llm_response_wrapper *wrapper = file->private_data;
+    struct file_request_mapping *mapping;
+    struct hlist_node *tmp;
+    unsigned long flags;
+
+    /* Remove file from mapping table */
+    spin_lock_irqsave(&file_map_lock, flags);
+    hash_for_each_possible_safe(file_request_map, mapping, tmp, node, wrapper->request_id) {
+        if (mapping->file == file) {
+            hash_del(&mapping->node);
+            kfree(mapping);
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&file_map_lock, flags);
 
     /* Free response wrapper */
     if (wrapper) {
@@ -1164,93 +954,84 @@ static int orchestrator_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-/* Updated orchestrator_write function */
-/* Modified write function for client interface */
 static ssize_t orchestrator_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
 {
-    struct llm_request user_req;
     struct llm_response_wrapper *wrapper = file->private_data;
+    struct file_request_mapping *mapping;
+    unsigned long flags;
     int ret;
+    struct llm_request *user_req = kmalloc(sizeof(struct llm_request), GFP_KERNEL);
 
-    if (!wrapper || count != sizeof(struct llm_request))
+    if (!user_req)
+        return -ENOMEM;
+
+    if (!wrapper || count != sizeof(struct llm_request)) {
+        kfree(user_req);  /* Free allocation on error */
         return -EINVAL;
+    }
 
     /* Copy and validate request from user */
-    if (copy_from_user(&user_req, buf, sizeof(user_req)))
+    if (copy_from_user(user_req, buf, sizeof(*user_req))) {
+        kfree(user_req);  /* Free allocation on error */
         return -EFAULT;
+    }
 
     /* Validate request fields */
-    if (user_req.conversation_id <= 0 || user_req.prompt[0] == '\0')
+    if (user_req->conversation_id <= 0 || user_req->prompt[0] == '\0') {
+        kfree(user_req);  /* Free allocation on error */
         return -EINVAL;
+    }
 
     /* Override priority from wrapper */
-    user_req.priority = wrapper->priority;
+    user_req->priority = wrapper->priority;
 
     /* Override provider if set via ioctl */
-    if (user_req.provider_override < 0 && wrapper->preferred_provider >= 0)
-        user_req.provider_override = wrapper->preferred_provider;
+    if (user_req->provider_override < 0 && wrapper->preferred_provider >= 0)
+        user_req->provider_override = wrapper->preferred_provider;
+
+    /* Assign request ID */
+    user_req->request_id = wrapper->request_id;
+
+    /* Add file to request mapping */
+    mapping = kmalloc(sizeof(*mapping), GFP_KERNEL);
+    if (!mapping) {
+        kfree(user_req);  /* Free allocation on error */
+        return -ENOMEM;
+    }
+
+    mapping->file = file;
+    mapping->request_id = user_req->request_id;
+
+    spin_lock_irqsave(&file_map_lock, flags);
+    hash_add(file_request_map, &mapping->node, mapping->request_id);
+    spin_unlock_irqrestore(&file_map_lock, flags);
 
     /* Reset completion flag */
     atomic_set(&wrapper->completed, 0);
 
     /* Submit to scheduler directly - NON-BLOCKING */
-    ret = scheduler_submit_request(&user_req, user_req.priority);
-    if (ret < 0)
+    ret = scheduler_submit_request(user_req, user_req->priority);
+    if (ret < 0) {
+        /* Clean up mapping on error */
+        spin_lock_irqsave(&file_map_lock, flags);
+        hash_del(&mapping->node);
+        spin_unlock_irqrestore(&file_map_lock, flags);
+        kfree(mapping);
+        kfree(user_req);  /* Free allocation on error */
         return ret;
+    }
 
-    /* Wake up dispatcher */
+    /* Signal dispatcher that a new request is waiting */
+    atomic_set(&next_request_waiting, 1);
     wake_up(&dispatcher_wait_queue);
+
+    /* We can free user_req here because scheduler_submit_request makes a copy */
+    kfree(user_req);
 
     return count;
 }
 
-/* Store response for a request */
-static void store_response(struct llm_request *req, struct llm_response *resp)
-{
-    struct response_entry *entry;
-    unsigned long flags;
-
-    /* Allocate response entry */
-    entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-    if (!entry)
-        return;
-
-    /* Initialize entry */
-    entry->conversation_id = req->conversation_id;
-    entry->request_id = req->request_id;
-    memcpy(&entry->response, resp, sizeof(*resp));
-    atomic_set(&entry->complete, 1);
-
-    /* Add to hash table */
-    spin_lock_irqsave(&response_lock, flags);
-    hash_add(response_table, &entry->node, entry->request_id);
-    spin_unlock_irqrestore(&response_lock, flags);
-
-    /* Mark the request complete in wrapper */
-    mark_request_complete(req->request_id);
-}
-/* Mark request as complete in wrapper */
-static void mark_request_complete(int request_id)
-{
-    struct file *file;
-    struct llm_response_wrapper *wrapper;
-
-    /* This requires a mechanism to map request_id to file */
-    /* For simplicity, we can maintain a hash table of request_id -> file */
-
-    file = find_file_by_request_id(request_id);
-    if (!file)
-        return;
-
-    wrapper = file->private_data;
-    if (wrapper) {
-        atomic_set(&wrapper->completed, 1);
-        /* Copy response to wrapper */
-        copy_response_to_wrapper(request_id, wrapper);
-    }
-}
-
-/* Updated orchestrator_read function with thread safety */
+/* Read operation - get response from provider */
 static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
     struct llm_response_wrapper *wrapper = file->private_data;
@@ -1342,7 +1123,7 @@ static ssize_t orchestrator_read(struct file *file, char __user *buf, size_t cou
     return ret;
 }
 
-/* New ioctl function to support additional controls */
+/* IOCTL handler for additional controls */
 static long orchestrator_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct llm_response_wrapper *wrapper = file->private_data;
@@ -1378,20 +1159,181 @@ static long orchestrator_ioctl(struct file *file, unsigned int cmd, unsigned lon
             value = atomic_read(&wrapper->completed);
             if (copy_to_user((int __user *)arg, &value, sizeof(int)))
                 return -EFAULT;
-
             return 0;
-
-        case IOCTL_GET_PROVIDER_STATS:
-            /* Implement provider stats retrieval */
-            return -ENOSYS; /* Not implemented yet */
 
         default:
             return -ENOTTY; /* Inappropriate ioctl for device */
     }
 }
 
-static DEVICE_ATTR(provider_hosts, 0644, provider_host_show, provider_host_store);
-/* Fix for module initialization order in orchestrator_init() in orchestrator_main.c */
+/* Show provider host information */
+static ssize_t provider_host_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int i, len = 0;
+
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        len += scnprintf(buf + len, PAGE_SIZE - len, "Provider %d (%s): %s:%d%s\n",
+                        i, provider_configs[i].domain_name,
+                        provider_configs[i].host_ip, provider_configs[i].port,
+                        provider_configs[i].path);
+    }
+
+    return len;
+}
+
+/* Store provider host information */
+static ssize_t provider_host_store(struct device *dev, struct device_attribute *attr,
+                                 const char *buf, size_t count)
+{
+    int provider, port;
+    char ip[MAX_IP_LENGTH];
+
+    if (sscanf(buf, "%d,%[^,],%d", &provider, ip, &port) != 3) {
+        pr_err("provider_host_store: Invalid format, expected: provider_id,ip,port\n");
+        return -EINVAL;
+    }
+
+    if (provider < 0 || provider >= PROVIDER_COUNT) {
+        pr_err("provider_host_store: Invalid provider ID: %d\n", provider);
+        return -EINVAL;
+    }
+
+    if (!is_ip_address_valid(ip)) {
+        pr_err("provider_host_store: Invalid IP address: %s\n", ip);
+        return -EINVAL;
+    }
+
+    if (port <= 0 || port > 65535) {
+        pr_err("provider_host_store: Invalid port: %d\n", port);
+        return -EINVAL;
+    }
+
+    /* Update the configuration */
+    mutex_lock(&orchestrator_mutex);
+
+    strncpy(provider_configs[provider].host_ip, ip, MAX_IP_LENGTH - 1);
+    provider_configs[provider].host_ip[MAX_IP_LENGTH - 1] = '\0';
+    provider_configs[provider].port = port;
+
+    mutex_unlock(&orchestrator_mutex);
+
+    pr_info("Updated provider %d (%s) to use IP: %s, port: %d\n",
+            provider, provider_configs[provider].domain_name, ip, port);
+
+    return count;
+}
+
+/* Show current scheduler algorithm */
+static ssize_t scheduler_algorithm_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int algorithm = atomic_read(&global_scheduler.current_algorithm);
+    const char *name;
+
+    switch (algorithm) {
+        case SCHEDULER_ROUND_ROBIN: name = "Round Robin"; break;
+        case SCHEDULER_WEIGHTED: name = "Weighted"; break;
+        case SCHEDULER_PRIORITY: name = "Priority"; break;
+        case SCHEDULER_PERFORMANCE: name = "Performance"; break;
+        case SCHEDULER_COST_AWARE: name = "Cost Aware"; break;
+        case SCHEDULER_FALLBACK: name = "Fallback"; break;
+        case SCHEDULER_FIFO: name = "FIFO"; break;
+        default: name = "Unknown"; break;
+    }
+
+    return scnprintf(buf, PAGE_SIZE, "%d (%s)\n", algorithm, name);
+}
+
+/* Set scheduler algorithm */
+static ssize_t scheduler_algorithm_store(struct device *dev, struct device_attribute *attr,
+                                        const char *buf, size_t count)
+{
+    int algorithm;
+
+    if (kstrtoint(buf, 10, &algorithm) != 0)
+        return -EINVAL;
+
+    if (algorithm < 0 || algorithm > SCHEDULER_MAX_ALGORITHM)
+        return -EINVAL;
+
+    atomic_set(&global_scheduler.current_algorithm, algorithm);
+    return count;
+}
+
+/* Initialize CPU-like scheduler components */
+static int cpu_scheduler_init(void)
+{
+    int i, ret;
+
+    /* Initialize wait queues */
+    init_waitqueue_head(&dispatcher_wait_queue);
+    init_waitqueue_head(&read_wait_queue);
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        init_waitqueue_head(&provider_wait_queues[i]);
+        spin_lock_init(&provider_queue_locks[i]);
+        atomic_set(&provider_available[i], 1);
+        provider_queues[i].request = NULL;
+        atomic_set(&provider_queues[i].has_request, 0);
+    }
+
+    /* Create provider worker threads */
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        provider_threads[i] = kthread_run(provider_worker_thread,
+                                         (void *)(long)i,
+                                         "llm_worker_%d", i);
+        if (IS_ERR(provider_threads[i])) {
+            ret = PTR_ERR(provider_threads[i]);
+            pr_err("Failed to create provider worker thread %d: %d\n", i, ret);
+            goto fail_workers;
+        }
+    }
+
+    /* Create dispatcher thread */
+    dispatcher_thread = kthread_run(dispatcher_thread_fn, NULL, "llm_dispatcher");
+    if (IS_ERR(dispatcher_thread)) {
+        ret = PTR_ERR(dispatcher_thread);
+        pr_err("Failed to create dispatcher thread: %d\n", ret);
+        goto fail_dispatcher;
+    }
+
+    atomic_set(&scheduler_running, 1);
+    pr_info("CPU-like LLM scheduler initialized\n");
+    return 0;
+
+fail_dispatcher:
+    i = PROVIDER_COUNT;
+
+fail_workers:
+    atomic_set(&scheduler_running, 0);
+    while (--i >= 0) {
+        if (!IS_ERR_OR_NULL(provider_threads[i]))
+            kthread_stop(provider_threads[i]);
+    }
+    return ret;
+}
+
+/* Clean up CPU-like scheduler components */
+static void cpu_scheduler_cleanup(void)
+{
+    int i;
+
+    atomic_set(&scheduler_running, 0);
+
+    /* Stop dispatcher thread */
+    if (!IS_ERR_OR_NULL(dispatcher_thread)) {
+        kthread_stop(dispatcher_thread);
+    }
+
+    /* Stop provider worker threads */
+    for (i = 0; i < PROVIDER_COUNT; i++) {
+        if (!IS_ERR_OR_NULL(provider_threads[i])) {
+            kthread_stop(provider_threads[i]);
+        }
+    }
+
+    pr_info("CPU-like LLM scheduler cleaned up\n");
+}
+
+/* Module initialization */
 static int __init orchestrator_init(void)
 {
     int ret;
@@ -1399,7 +1341,7 @@ static int __init orchestrator_init(void)
 
     pr_info("LLM Orchestrator: Initializing module version %s\n", DRIVER_VERSION);
 
-    /* Step 1: Initialize memory management first as it's a dependency for everything else */
+    /* Step 1: Initialize memory management */
     ret = memory_management_init();
     if (ret) {
         pr_err("orchestrator_init: Failed to initialize memory management: %d\n", ret);
@@ -1415,7 +1357,7 @@ static int __init orchestrator_init(void)
     }
     pr_info("LLM Orchestrator: JSON manager initialized\n");
 
-    /* Step 3: InitializeF context management */
+    /* Step 3: Initialize context management */
     ret = context_management_init();
     if (ret) {
         pr_err("orchestrator_init: Failed to initialize context management: %d\n", ret);
@@ -1438,21 +1380,25 @@ static int __init orchestrator_init(void)
         goto fail_tls;
     }
     pr_info("LLM Orchestrator: TLS subsystem initialized\n");
-    /*Step 8 Scheduler Registry Init*/
-    ret = scheduler_registry_init();
-    if (ret) {
-        pr_err("orchestrator_init: Failed to initialize scheduler registry: %d\n", ret);
-        goto fail_registry;
-    }
-    pr_info("LLM Orchestrator: Scheduler registry initialized\n");
 
+    /* Step 6: Initialize scheduler registry */
+    pr_info("Initializing global scheduler\n");
+	ret = 0;
 
     /* Step 7: Initialize scheduler and global state */
     scheduler_init(&global_scheduler);
-    set_scheduler_state(&global_scheduler);
     pr_info("LLM Orchestrator: Scheduler initialized\n");
-    /* Step 8: Register character device */
-   ret = alloc_chrdev_region(&dev, 0, 1, MODULE_NAME);
+
+    /* Step 8: Initialize CPU-like scheduler components */
+    ret = cpu_scheduler_init();
+    if (ret) {
+        pr_err("orchestrator_init: Failed to initialize CPU-like scheduler: %d\n", ret);
+        goto fail_cpu_scheduler;
+    }
+    pr_info("LLM Orchestrator: CPU-like scheduler initialized\n");
+
+    /* Step 9: Register character device */
+    ret = alloc_chrdev_region(&dev, 0, 1, MODULE_NAME);
     if (ret < 0) {
         pr_err("orchestrator_init: Failed to allocate chrdev region: %d\n", ret);
         goto fail_chrdev;
@@ -1468,11 +1414,11 @@ static int __init orchestrator_init(void)
         goto fail_cdev_add;
     }
 
-    /* Step 9: Create device class and device */
+    /* Step 10: Create device class and device */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
     orchestrator_class = class_create(MODULE_NAME);
 #else
-    orchestrator_class = class_create(MODULE_NAME);
+    orchestrator_class = class_create(THIS_MODULE, MODULE_NAME);
 #endif
 
     if (IS_ERR(orchestrator_class)) {
@@ -1488,68 +1434,18 @@ static int __init orchestrator_init(void)
         goto fail_device;
     }
 
-    /* Step 10: Create sysfs attributes */
+    /* Step 11: Create sysfs attributes */
+    ret = device_create_file(orchestrator_device, &dev_attr_provider_hosts);
+    if (ret) {
+        pr_err("orchestrator_init: Failed to create provider_hosts sysfs attribute: %d\n", ret);
+        goto fail_sysfs;
+    }
+
     ret = device_create_file(orchestrator_device, &dev_attr_scheduler_algorithm);
     if (ret) {
         pr_err("orchestrator_init: Failed to create scheduler_algorithm sysfs attribute: %d\n", ret);
         goto fail_sysfs;
     }
-
-    ret = device_create_file(orchestrator_device, &dev_attr_provider_metrics);
-    if (ret) {
-        pr_err("orchestrator_init: Failed to create provider_metrics sysfs attribute: %d\n", ret);
-        goto fail_sysfs;
-    }
-
-    ret = device_create_file(orchestrator_device, &dev_attr_reset_metrics);
-    if (ret) {
-        pr_err("orchestrator_init: Failed to create reset_metrics sysfs attribute: %d\n", ret);
-        goto fail_sysfs;
-    }
-
-    ret = device_create_file(orchestrator_device, &dev_attr_scheduler_weights);
-    if (ret) {
-        pr_err("orchestrator_init: Failed to create scheduler_weights sysfs attribute: %d\n", ret);
-        goto fail_sysfs;
-    }
-
-    ret = device_create_file(orchestrator_device, &dev_attr_auto_adjust);
-    if (ret) {
-        pr_err("orchestrator_init: Failed to create auto_adjust sysfs attribute: %d\n", ret);
-        goto fail_sysfs;
-    }
-
-    ret = device_create_file(orchestrator_device, &dev_attr_fifo_status);
-    if (ret) {
-        pr_err("orchestrator_init: Failed to create fifo_status sysfs attribute: %d\n", ret);
-        goto fail_sysfs;
-    }
-
-    ret = device_create_file(orchestrator_device, &dev_attr_context_status);
-    if (ret) {
-        pr_err("orchestrator_init: Failed to create context_status sysfs attribute: %d\n", ret);
-        goto fail_sysfs;
-    }
-
-    ret = device_create_file(orchestrator_device, &dev_attr_memory_stats);
-    if (ret) {
-        pr_err("orchestrator_init: Failed to create memory_stats sysfs attribute: %d\n", ret);
-        goto fail_sysfs;
-    }
-
-    ret = device_create_file(orchestrator_device, &dev_attr_memory_limits);
-    if (ret) {
-        pr_err("orchestrator_init: Failed to create memory_limits sysfs attribute: %d\n", ret);
-        goto fail_sysfs;
-    }
-    ret = device_create_file(orchestrator_device, &dev_attr_provider_hosts);
-	if (ret) {
-    	pr_err("orchestrator_init: Failed to create provider_hosts sysfs attribute: %d\n", ret);
-    	goto fail_sysfs;
-	}
-
-    /* Step 11: Initialize mutex */
-    mutex_init(&orchestrator_mutex);
 
     /* Step 12: Setup maintenance timer */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
@@ -1563,8 +1459,6 @@ static int __init orchestrator_init(void)
     return 0;
 
     /* Error handling with proper cleanup */
-    fail_registry:
-    pr_info("Registry Failed");
     fail_sysfs:
     device_destroy(orchestrator_class, MKDEV(major_number, 0));
     fail_device:
@@ -1574,7 +1468,9 @@ static int __init orchestrator_init(void)
     fail_cdev_add:
     unregister_chrdev_region(MKDEV(major_number, 0), 1);
     fail_chrdev:
-    clear_all_api_keys();
+    cpu_scheduler_cleanup();
+    fail_cpu_scheduler:
+    /* TLS cleanup */
     fail_tls:
     network_cleanup();
     fail_network:
@@ -1587,8 +1483,7 @@ static int __init orchestrator_init(void)
     return ret;
 }
 
-
-/* Fix for module exit to ensure proper cleanup order */
+/* Module exit */
 static void __exit orchestrator_exit(void)
 {
     pr_info("LLM Orchestrator: Unloading module\n");
@@ -1598,15 +1493,8 @@ static void __exit orchestrator_exit(void)
     pr_debug("LLM Orchestrator: Maintenance timer stopped\n");
 
     /* Step 2: Remove sysfs attributes */
+    device_remove_file(orchestrator_device, &dev_attr_provider_hosts);
     device_remove_file(orchestrator_device, &dev_attr_scheduler_algorithm);
-    device_remove_file(orchestrator_device, &dev_attr_provider_metrics);
-    device_remove_file(orchestrator_device, &dev_attr_reset_metrics);
-    device_remove_file(orchestrator_device, &dev_attr_scheduler_weights);
-    device_remove_file(orchestrator_device, &dev_attr_auto_adjust);
-    device_remove_file(orchestrator_device, &dev_attr_fifo_status);
-    device_remove_file(orchestrator_device, &dev_attr_context_status);
-    device_remove_file(orchestrator_device, &dev_attr_memory_stats);
-    device_remove_file(orchestrator_device, &dev_attr_memory_limits);
     pr_debug("LLM Orchestrator: Sysfs attributes removed\n");
 
     /* Step 3: Unregister device */
@@ -1616,12 +1504,12 @@ static void __exit orchestrator_exit(void)
     unregister_chrdev_region(MKDEV(major_number, 0), 1);
     pr_debug("LLM Orchestrator: Character device unregistered\n");
 
-    /* Step 4: Clean up resources in reverse initialization order */
-    clear_all_api_keys();
-    pr_debug("LLM Orchestrator: API keys securely cleared\n");
+    /* Step 4: Clean up CPU-like scheduler */
+    cpu_scheduler_cleanup();
+    pr_debug("LLM Orchestrator: CPU-like scheduler cleaned up\n");
 
-    /* Step 5: Clean up TLS */
-    pr_debug("LLM Orchestrator: TLS subsystem cleaned up\n");
+    /* Step 5: Clean up scheduler registry */
+    pr_debug("LLM Orchestrator: Scheduler registry cleaned up\n");
 
     /* Step 6: Clean up network */
     network_cleanup();
@@ -1636,22 +1524,17 @@ static void __exit orchestrator_exit(void)
     json_manager_cleanup();
     pr_debug("LLM Orchestrator: JSON manager cleaned up\n");
 
-    /* Step 9: Clean up FIFO queue and memory management last */
-    fifo_cleanup(&global_scheduler.fifo);
+    /* Step 9: Clean up memory management */
     memory_management_cleanup();
     pr_debug("LLM Orchestrator: Memory management cleaned up\n");
-	scheduler_registry_cleanup();
-    pr_debug("LLM Orchestrator: Scheduler registry cleaned up\n");
-    
+
     pr_info("LLM Orchestrator: Module unloaded\n");
 }
-
-
 
 module_init(orchestrator_init);
 module_exit(orchestrator_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LLM Orchestrator");
-MODULE_DESCRIPTION("Enhanced LLM Orchestrator with Context Management and Advanced Scheduling");
+MODULE_DESCRIPTION("Enhanced LLM Orchestrator with CPU-like Scheduling");
 MODULE_VERSION(DRIVER_VERSION);
